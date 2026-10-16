@@ -2,335 +2,178 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { shortcuts } from "../data/shortcuts";
 import { chordLabel, chordsMatch, keyEventToChord, normalizeKeys, prettyKey, requiresBuilder } from "../lib/shortcut";
-import { CATEGORY_LABELS, type Shortcut, type ShortcutCategory } from "../types/shortcut";
-
-type Result = "correct" | "incorrect" | null;
-type GameMode = "practice" | "timed" | "unlimited";
-
-const categories = Object.keys(CATEGORY_LABELS) as ShortcutCategory[];
-
-function categoryFromQuery(value: string | null): ShortcutCategory | "all" {
-  return value && categories.includes(value as ShortcutCategory) ? value as ShortcutCategory : "all";
-}
-
-function pickQuestion(pool: Shortcut[], previousId?: string): Shortcut {
-  const choices = pool.length > 1 ? pool.filter((shortcut) => shortcut.id !== previousId) : pool;
-  return choices[Math.floor(Math.random() * choices.length)];
-}
+import { dayKey, freshRun, levelFor, makeDeck, MODES, recordAttempt, recordSession, runReducer, type GameMode } from "../lib/game";
+import { readProfile, updateProfile, useProfile } from "../lib/profile";
+import { CATEGORY_LABELS, type ShortcutCategory } from "../types/shortcut";
 
 export default function ShortcutTrainer() {
   const searchParams = useSearchParams();
-  const initialCategory = categoryFromQuery(searchParams.get("category"));
-  const initialMode: GameMode = searchParams.get("mode") === "timed" ? "timed" : searchParams.get("mode") === "unlimited" ? "unlimited" : "practice";
-  const initialPool = useMemo(() => initialCategory === "all" ? shortcuts : shortcuts.filter((shortcut) => shortcut.category === initialCategory), [initialCategory]);
-  const [category, setCategory] = useState<ShortcutCategory | "all">(initialCategory);
-  const [mode, setMode] = useState<GameMode>(initialMode);
-  const [question, setQuestion] = useState<Shortcut>(initialPool[0]);
-  const [captured, setCaptured] = useState<string[]>([]);
-  const [result, setResult] = useState<Result>(null);
-  const [score, setScore] = useState(0);
-  const [answered, setAnswered] = useState(0);
-  const [correctAnswers, setCorrectAnswers] = useState(0);
-  const [streak, setStreak] = useState(0);
-  const [bestStreak, setBestStreak] = useState(0);
-  const [startedAt, setStartedAt] = useState(() => Date.now());
-  const [lastTime, setLastTime] = useState<number | null>(null);
-  const [showBuilder, setShowBuilder] = useState(false);
-  const [soundEnabled, setSoundEnabled] = useState(true);
-  const [sessionFinished, setSessionFinished] = useState(false);
-  const [timeLeft, setTimeLeft] = useState<number | null>(initialMode === "timed" ? 60 : null);
-  const resultActionRef = useRef<HTMLButtonElement>(null);
-  const summaryButtonRef = useRef<HTMLButtonElement>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  return <Game key={searchParams.toString()} searchParams={searchParams} />;
+}
 
-  const progress = Math.min(answered, 10);
+function Game({ searchParams }: { searchParams: ReturnType<typeof useSearchParams> }) {
+  const requestedMode = searchParams.get("mode") ?? "practice";
+  const mode: GameMode = Object.hasOwn(MODES, requestedMode) ? requestedMode as GameMode : "practice";
+  const requestedCategory = searchParams.get("category") ?? "all";
+  const category = mode !== "daily" && Object.hasOwn(CATEGORY_LABELS, requestedCategory) ? requestedCategory as ShortcutCategory : "all";
+  const pool = useMemo(() => category === "all" ? shortcuts : shortcuts.filter((s) => s.category === category), [category]);
+  const [run, dispatch] = useReducer(runReducer, pool, freshRun);
+  const [showBuilder, setShowBuilder] = useState(false);
+  const [autoNext, setAutoNext] = useState(mode === "timed");
+  const { profile, saved } = useProfile();
+  const mainRef = useRef<HTMLElement>(null);
+  const actionRef = useRef<HTMLButtonElement>(null);
+  const audioRef = useRef<AudioContext | null>(null);
+  const savedAttempts = useRef(0);
+  const savedSession = useRef(false);
+  const sessionDay = useRef("");
+  const [previousBest, setPreviousBest] = useState(0);
+  const question = run.deck[run.index];
+  const result = run.phase === "result" ? run.attempts.at(-1) : undefined;
   const builderRequired = requiresBuilder(question.expected);
   const builderVisible = showBuilder || builderRequired;
-  const timedOut = mode === "timed" && timeLeft === 0;
-  const sessionOver = sessionFinished || timedOut;
+  const correct = run.attempts.filter((a) => a.correct).length;
+  const flawless = correct > 0 && run.attempts.every((a) => a.correct && !a.assisted);
+  const finite = ["practice", "daily", "review"].includes(mode);
+  const level = levelFor(profile.xp);
+  const timeLeft = Math.ceil(run.remaining / 1000);
+  const nextFinishes = finite && run.attempts.length >= 10 || mode === "survival" && run.lives <= 0;
+  const missed = [...new Map(run.attempts.filter((a) => !a.correct || a.assisted).map((a) => [a.shortcut.id, a.shortcut])).values()];
 
-  useEffect(() => {
-    const randomizeInitialQuestion = window.setTimeout(() => setQuestion(pickQuestion(initialPool)), 0);
-    return () => window.clearTimeout(randomizeInitialQuestion);
-  }, [initialPool]);
-
-  const playFeedbackSound = useCallback((isCorrect: boolean) => {
-    if (!soundEnabled || typeof window === "undefined" || !window.AudioContext) return;
-    const context = audioContextRef.current ?? new window.AudioContext();
-    audioContextRef.current = context;
-    if (context.state === "suspended") void context.resume();
-
-    const now = context.currentTime;
-    const notes = isCorrect ? [261.63, 329.63, 392] : [220, 164.81];
-    notes.forEach((frequency, index) => {
-      const start = now + index * (isCorrect ? 0.045 : 0.08);
-      const end = start + (isCorrect ? 0.58 : 0.24);
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      oscillator.type = isCorrect ? "triangle" : "sine";
-      oscillator.frequency.setValueAtTime(frequency, start);
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(isCorrect ? 0.12 : 0.08, start + 0.012);
-      gain.gain.exponentialRampToValueAtTime(0.0001, end);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start(start);
-      oscillator.stop(end);
-    });
-  }, [soundEnabled]);
-
-  const resetQuestion = useCallback((nextCategory = category) => {
-    if ((mode === "practice" && answered >= 10) || (mode === "timed" && timeLeft === 0)) {
-      setSessionFinished(true);
-      return;
-    }
-    const nextPool = nextCategory === "all" ? shortcuts : shortcuts.filter((shortcut) => shortcut.category === nextCategory);
-    setQuestion((current) => pickQuestion(nextPool, current.id));
-    setCaptured([]);
-    setResult(null);
-    setStartedAt(Date.now());
-    setLastTime(null);
-    setShowBuilder(false);
-  }, [answered, category, mode, timeLeft]);
-
-  const submitChord = useCallback((keys: string[]) => {
-    if (result || keys.length === 0) return;
-    const isCorrect = chordsMatch(keys, question.expected);
-    const elapsed = Math.max(1, (Date.now() - startedAt) / 1000);
-    setCaptured(normalizeKeys(keys));
-    setResult(isCorrect ? "correct" : "incorrect");
-    playFeedbackSound(isCorrect);
-    setAnswered((value) => value + 1);
-    setLastTime(elapsed);
-    if (isCorrect) {
-      setScore((value) => value + Math.max(50, Math.round(100 - elapsed * 5)));
-      setCorrectAnswers((value) => value + 1);
-      const nextStreak = streak + 1;
-      setStreak(nextStreak);
-      setBestStreak((value) => Math.max(value, nextStreak));
-    } else {
-      setStreak(0);
-    }
-  }, [playFeedbackSound, question.expected, result, startedAt, streak]);
-
-  useEffect(() => {
-    if (result) resultActionRef.current?.focus();
-  }, [result]);
-
-  const retryQuestion = useCallback(() => {
-    setCaptured([]);
-    setResult(null);
-    setStartedAt(Date.now());
-    setLastTime(null);
-    setShowBuilder(false);
+  const playSound = useCallback((good: boolean) => {
+    if (!readProfile().sound || !window.AudioContext) return;
+    try {
+      const context = audioRef.current ?? new AudioContext();
+      audioRef.current = context;
+      if (context.state === "suspended") void context.resume().catch(() => {});
+      (good ? [523.25, 659.25, 783.99] : [196, 164.81]).forEach((frequency, i) => {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const start = context.currentTime + i * .055;
+        oscillator.type = "triangle";
+        oscillator.frequency.value = frequency;
+        gain.gain.setValueAtTime(.0001, start);
+        gain.gain.exponentialRampToValueAtTime(.07, start + .01);
+        gain.gain.exponentialRampToValueAtTime(.0001, start + .25);
+        oscillator.connect(gain); gain.connect(context.destination);
+        oscillator.start(start); oscillator.stop(start + .26);
+      });
+    } catch { /* Audio is optional; the round continues if the browser blocks it. */ }
   }, []);
 
-  const startNewSession = useCallback(() => {
-    const nextPool = category === "all" ? shortcuts : shortcuts.filter((shortcut) => shortcut.category === category);
-    setQuestion((current) => pickQuestion(nextPool, current.id));
-    setCaptured([]);
-    setResult(null);
-    setScore(0);
-    setAnswered(0);
-    setCorrectAnswers(0);
-    setStreak(0);
-    setBestStreak(0);
-    setStartedAt(Date.now());
-    setLastTime(null);
-    setShowBuilder(false);
-    setSessionFinished(false);
-    setTimeLeft(mode === "timed" ? 60 : null);
-  }, [category, mode]);
+  useEffect(() => () => { void audioRef.current?.close(); }, []);
+  // Save each answered prompt exactly once, including when a timer ends the round.
+  useEffect(() => {
+    for (const attempt of run.attempts.slice(savedAttempts.current)) {
+      updateProfile((p) => recordAttempt(p, attempt.shortcut.id, attempt.correct, attempt.assisted, attempt.xp, run.bestStreak));
+    }
+    savedAttempts.current = run.attempts.length;
+    if (run.phase === "finished" && !savedSession.current && run.attempts.length) {
+      savedSession.current = true;
+      updateProfile((p) => recordSession(p, mode, run.score, sessionDay.current, run.attempts.length >= 10));
+    }
+  }, [run.attempts, run.bestStreak, run.phase, run.score, mode]);
 
-  const chooseMode = useCallback((nextMode: GameMode) => {
-    const nextPool = category === "all" ? shortcuts : shortcuts.filter((shortcut) => shortcut.category === category);
-    setMode(nextMode);
-    setQuestion((current) => pickQuestion(nextPool, current.id));
-    setCaptured([]);
-    setResult(null);
-    setScore(0);
-    setAnswered(0);
-    setCorrectAnswers(0);
-    setStreak(0);
-    setBestStreak(0);
-    setStartedAt(Date.now());
-    setLastTime(null);
+  const start = useCallback(() => {
+    savedAttempts.current = 0; savedSession.current = false;
+    sessionDay.current = dayKey();
+    setPreviousBest(readProfile().best[mode] ?? 0);
     setShowBuilder(false);
-    setSessionFinished(false);
-    setTimeLeft(nextMode === "timed" ? 60 : null);
-  }, [category]);
+    dispatch({ type: "start", deck: makeDeck(pool, mode, readProfile(), sessionDay.current), now: Date.now() });
+    mainRef.current?.focus({ preventScroll: true });
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }, [mode, pool]);
+  const next = useCallback(() => {
+    setShowBuilder(false);
+    const deck = makeDeck(pool, mode, readProfile(), sessionDay.current);
+    // Avoid a repeated question at the boundary between shuffled decks.
+    if (deck.length > 1 && deck[0].id === question.id) [deck[0], deck[1]] = [deck[1], deck[0]];
+    dispatch({ type: "next", deck, mode, now: Date.now() });
+    mainRef.current?.focus({ preventScroll: true });
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }, [mode, pool, question.id]);
+  const submit = useCallback((keys: string[]) => {
+    if (run.phase !== "playing" || run.paused) return;
+    const good = chordsMatch(keys, question.expected);
+    if (mode !== "timed" || Date.now() < run.deadline) playSound(good);
+    dispatch({ type: "answer", correct: good, keys: normalizeKeys(keys), mode, now: Date.now() });
+  }, [mode, playSound, question.expected, run.deadline, run.paused, run.phase]);
 
   useEffect(() => {
-    if (mode !== "timed" || sessionFinished || timeLeft === 0) return;
-    const timer = window.setInterval(() => setTimeLeft((value) => Math.max((value ?? 0) - 1, 0)), 1000);
+    if (mode !== "timed" || run.paused || run.phase === "ready" || run.phase === "finished") return;
+    const timer = window.setInterval(() => dispatch({ type: "tick", now: Date.now() }), 100);
     return () => window.clearInterval(timer);
-  }, [mode, sessionFinished, timeLeft]);
-
+  }, [mode, run.paused, run.phase]);
   useEffect(() => {
-    if (sessionOver) summaryButtonRef.current?.focus();
-  }, [sessionOver]);
-
+    if (!autoNext || run.phase !== "result" || run.paused) return;
+    const timer = window.setTimeout(next, result?.correct ? 1100 : 2200);
+    return () => window.clearTimeout(timer);
+  }, [autoNext, next, result?.correct, run.paused, run.phase]);
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
+    if (run.phase === "result" || run.phase === "finished" || run.paused) actionRef.current?.focus({ preventScroll: true });
+    if (run.phase === "finished") window.scrollTo({ top: 0, behavior: "instant" });
+  }, [run.phase, run.paused]);
+  useEffect(() => {
+    const onVisibility = () => { if (document.hidden) dispatch({ type: "pause", now: Date.now() }); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.repeat || event.isComposing) return;
       const target = event.target instanceof HTMLElement ? event.target : null;
-      const isInteractiveTarget = Boolean(target?.closest("button, a, select, input, textarea, .key-builder"));
-      const isTextEntryTarget = Boolean(target?.closest("select, input, textarea"));
-      if (sessionOver) {
-        if ((event.key === "Enter" || event.key === " ") && !isInteractiveTarget) {
-          event.preventDefault();
-          startNewSession();
-        }
-        return;
+      const interactive = target?.closest("button, a, select, input, textarea");
+      if (event.key === "Escape" && run.phase !== "ready" && run.phase !== "finished") {
+        event.preventDefault(); dispatch({ type: run.paused ? "resume" : "pause", now: Date.now() }); return;
       }
-      if (result === "incorrect" && event.key.toLowerCase() === "r" && !isTextEntryTarget) {
-        event.preventDefault();
-        retryQuestion();
-        return;
+      if (interactive) return;
+      if (run.paused) return;
+      if (run.phase === "ready" || run.phase === "finished") {
+        if (event.key === "Enter") { event.preventDefault(); start(); } return;
       }
-      if (result && !isInteractiveTarget) {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          resetQuestion();
-          return;
-        }
+      if (run.phase === "result") {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); next(); } return;
       }
-      if (result || event.repeat || builderRequired || isInteractiveTarget) return;
-      const isModifierOnly = ["Control", "Alt", "Shift", "Meta"].includes(event.key);
-      if (isModifierOnly) return;
-      const chord = keyEventToChord(event);
-      if (!chord.length) return;
-      event.preventDefault();
-      submitChord(chord);
+      // Tab always remains available for navigating the interface.
+      if (event.key === "Tab" && !event.ctrlKey && !event.altKey && !event.metaKey) return;
+      if (builderRequired || builderVisible || ["Control", "Alt", "Shift", "Meta"].includes(event.key)) return;
+      const keys = keyEventToChord(event);
+      if (requiresBuilder(keys)) return;
+      event.preventDefault(); submit(keys);
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [builderRequired, resetQuestion, result, retryQuestion, sessionOver, startNewSession, submitChord]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [builderRequired, builderVisible, next, run.paused, run.phase, start, submit]);
 
-  function chooseCategory(value: ShortcutCategory | "all") {
-    setCategory(value);
-    setSessionFinished(false);
-    setScore(0);
-    setAnswered(0);
-    setCorrectAnswers(0);
-    setStreak(0);
-    setBestStreak(0);
-    const nextPool = value === "all" ? shortcuts : shortcuts.filter((shortcut) => shortcut.category === value);
-    const nextQuestion = pickQuestion(nextPool);
-    setQuestion(nextQuestion);
-    setCaptured([]);
-    setResult(null);
-    setStartedAt(Date.now());
-    setLastTime(null);
-    setTimeLeft(mode === "timed" ? 60 : null);
-  }
+  return <main className="practice-shell" ref={mainRef} tabIndex={-1}>
+    <header className="practice-topbar"><Link href="/" className="brand"><span className="brand-mark">⌘</span><span>CHORD<span className="brand-slash">{"//"}</span></span></Link><div className="practice-nav"><span className="session-label">{MODES[mode].name.toUpperCase()}</span><span className="session-stat">{run.score.toLocaleString()} <small>PTS</small></span>{mode === "survival" && <span className="lives" aria-label={`${Math.max(0, run.lives)} lives left`}>{[0, 1, 2].map((i) => <span key={i} className={i < run.lives ? "" : "lost-life"}>♥</span>)}</span>}{mode === "timed" && <span className={`timer-stat ${timeLeft <= 10 ? "timer-warning" : ""}`}>◷ {timeLeft}s</span>}<button className="sound-toggle" onClick={() => updateProfile((p) => ({ ...p, sound: !p.sound }))} aria-label={profile.sound ? "Mute sounds" : "Enable sounds"}>{profile.sound ? "SOUND ON" : "SOUND OFF"}</button></div></header>
+    <div className="practice-layout">
+      <aside className="practice-sidebar"><Link href="/" className="back-link">← THE ARCADE</Link><div className="run-mode-icon">{MODES[mode].icon}</div><h2>{MODES[mode].name}</h2><p className="sidebar-description">{MODES[mode].description}</p><span className="sidebar-set">{category === "all" ? "All shortcuts" : CATEGORY_LABELS[category]}</span><div className="sidebar-progress"><div className="progress-heading"><span>{finite ? "ROUND PROGRESS" : mode === "timed" ? "TIME LEFT" : "CHORDS PLAYED"}</span><strong>{finite ? `${run.attempts.length} / 10` : mode === "timed" ? `${timeLeft}s` : run.attempts.length}</strong></div><div className="progress-track"><span style={{ width: `${finite ? run.attempts.length * 10 : mode === "timed" ? timeLeft / 60 * 100 : 100}%` }} /></div></div><div className={`combo-meter ${run.streak >= 3 ? "combo-active" : ""}`}><span className="micro-label">{run.streak >= 3 ? "YOU’RE ON FIRE" : "FIND YOUR FLOW"}</span><div><strong>×{Math.min(4, 1 + Math.floor(run.streak / 3))}</strong><span>{run.streak} combo</span></div><div className="combo-pips">{[0, 1, 2].map((i) => <span key={i} className={i < run.streak % 3 || run.streak >= 9 ? "lit" : ""} />)}</div><small>{run.streak >= 9 ? "Maximum multiplier. Keep it going!" : `${3 - run.streak % 3} clean answers to the next multiplier`}</small></div><label className="auto-next"><input type="checkbox" checked={autoNext} onChange={(e) => setAutoNext(e.target.checked)} /> Auto advance</label><div className="sidebar-note"><span className="note-icon">i</span><p><strong>Make it stick</strong>Three correct recalls without hints master a shortcut. Hints earn less XP and reset its mastery streak.</p></div><span className="sidebar-save">{saved ? `LEVEL ${level.level} · ${profile.xp} XP · SAVED LOCALLY` : "STORAGE UNAVAILABLE · THIS VISIT ONLY"}</span></aside>
 
-  return (
-    <main className="practice-shell">
-      <header className="practice-topbar">
-        <Link href="/" className="brand"><span className="brand-mark">⌘</span><span>CHORD<span className="brand-slash">{"//"}</span></span></Link>
-          <div className="practice-nav">
-            <span className="session-label">SESSION 01</span>
-            <span className="nav-divider" />
-            <span className="session-stat"><span className="mini-dot" />{score.toString().padStart(4, "0")} pts</span>
-            <span className="session-stat streak-stat">↗ {streak} streak</span>
-            {mode === "timed" && <span className={`session-stat timer-stat ${timeLeft !== null && timeLeft <= 10 ? "timer-warning" : ""}`} aria-live="polite">◷ {timeLeft}s</span>}
-            <button className="sound-toggle" type="button" onClick={() => setSoundEnabled((value) => !value)} aria-label={soundEnabled ? "Mute feedback sounds" : "Enable feedback sounds"} title={soundEnabled ? "Mute feedback sounds" : "Enable feedback sounds"}>{soundEnabled ? "◖))" : "◖×"}</button>
-          </div>
-      </header>
-
-      <div className="practice-layout">
-        <aside className="practice-sidebar">
-          <div className="sidebar-control">
-            <p className="sidebar-label">Game mode</p>
-            <div className="sidebar-select-wrap">
-              <select value={mode} onChange={(event) => chooseMode(event.target.value as GameMode)} aria-label="Choose game mode">
-                <option value="practice">Practice session</option>
-                <option value="timed">Timed challenge · 60s</option>
-                <option value="unlimited">Unlimited practice</option>
-              </select>
-              <span>⌄</span>
-            </div>
-          </div>
-          <div className="sidebar-control">
-            <p className="sidebar-label">Practice set</p>
-            <div className="sidebar-select-wrap">
-              <select value={category} onChange={(event) => chooseCategory(event.target.value as ShortcutCategory | "all")} aria-label="Choose shortcut category">
-                <option value="all">All shortcuts</option>
-                {categories.map((item) => <option key={item} value={item}>{CATEGORY_LABELS[item]}</option>)}
-              </select>
-              <span>⌄</span>
-            </div>
-          </div>
-          <div className="sidebar-progress">
-            <div className="progress-heading"><span>{mode === "timed" ? "Time remaining" : mode === "unlimited" ? "Reps completed" : "Session progress"}</span><strong>{mode === "timed" ? `${timeLeft}s` : mode === "unlimited" ? answered : `${progress.toString().padStart(2, "0")} / 10`}</strong></div>
-            <div className="progress-track"><span style={{ width: `${mode === "timed" ? Math.max(((timeLeft ?? 0) / 60) * 100, 3) : mode === "unlimited" ? "100" : Math.max(progress * 10, 3)}%` }} /></div>
-          </div>
-          <div className="sidebar-note">
-            <span className="note-icon">i</span>
-            <p><strong>How it works</strong>Press the shortcut for the action. Your chord is captured automatically.</p>
-          </div>
-          <Link href="/" className="back-link">← Back to home</Link>
-        </aside>
-
-        {sessionOver ? <SessionSummary restartButtonRef={summaryButtonRef} mode={mode} totalAnswered={answered} score={score} correctAnswers={correctAnswers} bestStreak={bestStreak} onRestart={startNewSession} /> : <section className={`practice-card ${result ? `has-${result}` : ""}`}>
-          <div className="practice-card-header">
-            <span className="question-number">PROMPT {String(Math.min(answered + 1, 10)).padStart(2, "0")}</span>
-            <span className="category-badge">{CATEGORY_LABELS[question.category]}</span>
-          </div>
-          <div className="question-content">
-            <p className="question-kicker">What&apos;s the chord for...</p>
-            <h1>{question.action}?</h1>
-            <p className="question-subtitle">{builderRequired ? "This shortcut can affect your computer. Practice it safely with the key builder." : "Press the keys together. We&apos;ll take it from there."}</p>
-          </div>
-
-          <div className="answer-zone">
-            <div className="captured-keys" aria-live="polite">
-              {captured.length > 0 ? captured.map((key) => <span key={key} className={`answer-key ${result === "correct" ? "key-correct" : result === "incorrect" ? "key-incorrect" : ""}`}>{key}</span>) : <span className="waiting-text"><span className="pulse-dot" />{builderRequired ? "Use the key builder below" : "Listening for your shortcut"}<span className="waiting-caret">_</span></span>}
-            </div>
-            {result === "correct" && <div className="feedback correct-feedback"><span className="feedback-icon">✓</span><span><strong>Nice one.</strong> That&apos;s the shortcut.</span><span className="feedback-time">{lastTime?.toFixed(1)}s</span></div>}
-            {result === "incorrect" && <div className="feedback incorrect-feedback"><span className="feedback-icon">×</span><span><strong>Not quite.</strong> The answer is <b>{chordLabel(question.expected)}</b>.</span></div>}
-          </div>
-
-          <div className="practice-card-footer">
-            {result ? (
-              <div className="result-actions">
-                {result === "incorrect" && <button className="button button-secondary" onClick={retryQuestion}>Try again <span className="button-arrow">↻</span></button>}
-                <button ref={resultActionRef} className="button button-primary next-button" onClick={() => resetQuestion()}>Next prompt <span className="button-arrow">→</span></button>
-              </div>
-            ) : (
-              builderRequired ? <span className="protected-hint"><span>◈</span>Protected shortcut · builder only</span> : <button className="builder-toggle" onClick={() => setShowBuilder((value) => !value)}>{showBuilder ? "Hide key builder" : "Shortcut not firing? Use the key builder"} <span>⌄</span></button>
-            )}
-            <span className="enter-hint">{result === "incorrect" ? <><kbd>R</kbd> retry · <kbd>Enter</kbd> next prompt</> : result ? <><kbd>Enter</kbd> next prompt</> : builderRequired ? "Select keys in the builder" : <><kbd>Space</kbd> or use your keyboard</>}</span>
-          </div>
-
-          {builderVisible && !result && <KeyBuilder key={question.id} onSubmit={submitChord} protectedShortcut={builderRequired} />}
-          {result === "incorrect" && question.tip && <p className="question-tip"><span>TIP</span>{question.tip}</p>}
-        </section>}
-      </div>
-
-      <footer className="practice-footer"><span>CHORD // SHORTCUT TRAINER</span><span>Local session · No account required</span></footer>
-    </main>
-  );
-}
-
-function SessionSummary({ restartButtonRef, mode, totalAnswered, score, correctAnswers, bestStreak, onRestart }: { restartButtonRef: { current: HTMLButtonElement | null }; mode: GameMode; totalAnswered: number; score: number; correctAnswers: number; bestStreak: number; onRestart: () => void }) {
-  const accuracy = totalAnswered ? Math.round((correctAnswers / totalAnswered) * 100) : 0;
-  const isTimed = mode === "timed";
-  return <section className="practice-card session-summary">
-    <div className="practice-card-header"><span className="question-number">{isTimed ? "TIME UP" : "SESSION COMPLETE"}</span><span className="category-badge">{isTimed ? `${totalAnswered} reps` : "10 prompts"}</span></div>
-    <div className="summary-copy"><p className="question-kicker">{isTimed ? "Fast fingers, clear recall" : "Good repetition compounds"}</p><h1>{isTimed ? "Time's up." : "That's a wrap."}</h1><p className="question-subtitle">{isTimed ? "Here's how your 60-second sprint landed." : "Your fingers got ten more reps of useful shortcuts."}</p></div>
-    <div className="summary-stats">
-      <div><strong>{accuracy}%</strong><span>accuracy</span></div>
-      <div><strong>{score.toString().padStart(4, "0")}</strong><span>points</span></div>
-      <div><strong>{bestStreak}</strong><span>best streak</span></div>
+      {run.phase === "ready" ? <section className="practice-card ready-card"><span className="question-number">YOUR NEXT GOOD HABIT STARTS HERE</span><div className="ready-emblem">{MODES[mode].icon}</div><p className="eyebrow">{mode === "daily" ? "TODAY’S SHARED CHALLENGE" : "READY WHEN YOU ARE"}</p><h1>{mode === "survival" ? "Three lives.\nMake them count." : mode === "timed" ? "60 seconds.\nFind your flow." : "Let’s make\nit automatic."}</h1><p>{MODES[mode].detail}. Correct answers build combos and XP. Use the on-screen keyboard for protected shortcuts.</p><button ref={actionRef} className="button button-primary" onClick={start}>Start round <span>→</span></button><span className="ready-hint"><kbd>Enter</kbd> start · <kbd>Esc</kbd> pause during play</span></section>
+      : run.phase === "finished" ? <section className="practice-card session-summary"><div className="practice-card-header"><span className="question-number">{finite && run.attempts.length < 10 ? "ROUND ENDED" : "ROUND COMPLETE"}</span><span className="category-badge">+{run.xp} XP</span></div><div className="summary-copy"><div className="summary-medal">{flawless ? "✦" : correct / Math.max(1, run.attempts.length) >= .7 ? "↗" : "◎"}</div><p className="eyebrow">{run.score > previousBest ? "NEW PERSONAL BEST" : "EVERY REP IS PROGRESS"}</p><h1>{flawless ? "Flawless flow." : correct / Math.max(1, run.attempts.length) >= .7 ? "Nicely played." : "You’re building it."}</h1><p className="question-subtitle">{run.attempts.length ? `${correct} of ${run.attempts.length} chords landed. ${missed.length ? "Let’s give the tricky ones another go." : "That’s useful muscle memory."}` : "A fresh round is one click away."}</p></div><div className="summary-stats"><div><strong>{run.score.toLocaleString()}</strong><span>points</span></div><div><strong>{Math.round(correct / Math.max(1, run.attempts.length) * 100)}%</strong><span>accuracy</span></div><div><strong>{run.bestStreak}</strong><span>best combo</span></div></div>{missed.length > 0 && <div className="review-list"><span className="micro-label">TAKE THESE WITH YOU</span>{missed.map((s) => <div key={s.id}><span>{s.action}</span><kbd>{chordLabel(s.expected)}</kbd></div>)}</div>}<div className="practice-card-footer summary-footer"><button ref={actionRef} className="button button-primary" onClick={start}>Play again <span>↻</span></button><Link className="button button-secondary" href={missed.length ? `/practice?mode=review${category === "all" ? "" : `&category=${category}`}` : "/"}>{missed.length ? "Practice weak spots" : "Back to arcade"} <span>→</span></Link></div></section>
+      : <section className={`practice-card play-card ${result ? result.correct ? "has-correct" : "has-incorrect" : ""}`}>
+        {run.paused && <div className="pause-overlay" role="dialog" aria-modal="true" aria-label="Round paused"><span className="eyebrow">TAKE A BREATH</span><h2>Flow on hold.</h2><p>Your round is paused. Come back when you’re ready.</p><button ref={actionRef} className="button button-primary" onClick={() => { dispatch({ type: "resume", now: Date.now() }); mainRef.current?.focus(); }}>Resume round <span>→</span></button><Link href="/" className="back-link">Back to arcade</Link></div>}
+        <div inert={run.paused}>
+        <div className="practice-card-header"><span className="question-number">CHORD {String(run.attempts.length + (result ? 0 : 1)).padStart(2, "0")}{finite ? " / 10" : ""}</span><span className="category-badge">{CATEGORY_LABELS[question.category]}</span></div>
+        <div className="round-dots" aria-label={`${run.attempts.length} answered`}>{(finite ? Array.from({ length: 10 }) : run.attempts.slice(-15)).map((_, i) => <span key={i} className={run.attempts[finite ? i : Math.max(0, run.attempts.length - 15) + i] ? run.attempts[finite ? i : Math.max(0, run.attempts.length - 15) + i].correct ? "dot-correct" : "dot-incorrect" : i === run.attempts.length ? "dot-current" : ""} />)}</div>
+        {result?.correct && run.streak > 0 && run.streak % 3 === 0 && <div className="combo-toast" role="status">ϟ {run.streak} COMBO · ×{Math.min(4, 1 + Math.floor(run.streak / 3))} {run.streak <= 9 ? "UNLOCKED" : "FLOW"}</div>}
+        <div className="question-content" key={question.id}><p className="question-kicker">{question.difficulty === "stretch" ? "A LITTLE CHALLENGE FOR YOU" : "YOUR MOVE"}</p><h1>{question.action}</h1><p className="question-subtitle">{result ? result.correct ? "Locked in. Keep the flow going." : "Take a look, then give another chord a go." : builderRequired ? "Build this chord safely on the keyboard below." : builderVisible ? "Select the keys on the keyboard below." : "Press the shortcut, or build it on screen."}</p></div>
+        <div className="answer-zone" aria-live="polite"><div className="captured-keys">{run.captured.length ? run.captured.map((key) => <span key={key} className={`answer-key ${result?.correct ? "key-correct" : "key-incorrect"}`}>{key}</span>) : result ? <span className="waiting-text">SKIPPED · ANSWER REVEALED BELOW</span> : <span className="waiting-text"><span className="pulse-dot" />{builderVisible ? "YOUR CHORD GOES HERE" : "LISTENING FOR YOUR SHORTCUT"}</span>}</div>{result && <div className={`feedback ${result.correct ? "correct-feedback" : "incorrect-feedback"}`}><span className="feedback-icon">{result.correct ? "✓" : "×"}</span><span><strong>{result.correct ? result.assisted ? "Good practice." : run.streak >= 3 ? "You’re in the zone!" : "That’s the one." : "Next time, you’ll know."}</strong>{!result.correct && <span className="correct-answer"> {chordLabel(question.expected)}</span>}</span><span className="feedback-time">{result.correct ? `+${result.points} PTS · ` : ""}{result.seconds.toFixed(1)}s</span></div>}</div>
+        {run.hint && !result && <div className="hint-reveal"><span>TRY THIS CHORD</span><strong>{chordLabel(question.expected)}</strong><small>Learning rep · reduced XP · no combo</small></div>}
+        {!result && builderVisible && <KeyBuilder key={`${question.id}-${run.attempts.length}`} onSubmit={submit} protectedShortcut={builderRequired} />}
+        {result && question.tip && <p className="question-tip"><span>REMEMBER</span>{question.tip}</p>}
+        <div className="practice-card-footer">{result ? <><button ref={actionRef} className="button button-primary next-button" onClick={next}>{nextFinishes ? "See results" : "Next chord"} <span>→</span></button><span className="enter-hint">{autoNext ? "Moving on automatically · " : ""}<kbd>Enter</kbd> continue</span></> : <div className="play-tools">{!builderRequired && <button className="builder-toggle" onClick={() => { setShowBuilder(!showBuilder); mainRef.current?.focus(); }}>{showBuilder ? "Use physical keyboard" : "Use on-screen keyboard"} <span>⌨</span></button>}<button className="text-button" disabled={run.hint} onClick={() => dispatch({ type: "hint" })}>{run.hint ? "Hint revealed" : "Need a hint?"}</button><button className="text-button" onClick={() => submit([])}>Skip</button></div>}</div>
+        <div className="card-bottomline"><span>{builderRequired ? "◈ PROTECTED CHORD · SAFE BUILDER" : "ACTIVE RECALL → MUSCLE MEMORY"}</span><button className="text-button" onClick={() => dispatch({ type: "pause", now: Date.now() })}>Pause <kbd>Esc</kbd></button></div>
+        </div>
+      </section>}
     </div>
-    <div className="practice-card-footer summary-footer"><button ref={restartButtonRef} className="button button-primary" onClick={onRestart}>Play again <span className="button-arrow">↻</span></button><span className="enter-hint"><kbd>Enter</kbd> new session</span></div>
-  </section>;
+    <footer className="practice-footer"><span>CHORD // ONE GOOD REP AT A TIME</span>{run.phase !== "ready" && run.phase !== "finished" && <button className="text-button" onClick={() => dispatch({ type: "finish" })}>Finish round</button>}<span>LEVEL {level.level} · {level.title.toUpperCase()}</span></footer>
+  </main>;
 }
-
 function KeyBuilder({ onSubmit, protectedShortcut }: { onSubmit: (keys: string[]) => void; protectedShortcut: boolean }) {
   const [keys, setKeys] = useState<string[]>([]);
   const alphaRows = [
@@ -338,7 +181,7 @@ function KeyBuilder({ onSubmit, protectedShortcut }: { onSubmit: (keys: string[]
     ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
     ["Z", "X", "C", "V", "B", "N", "M"],
   ];
-  const utilityKeys = ["Tab", "Delete", "Backspace", "F2", "F4"];
+  const utilityKeys = ["`", "/", "Tab", "Delete", "Backspace", "F2", "F4"];
   const arrows = ["Left", "Down", "Right", "Up"];
   function toggle(key: string) {
     setKeys((current) => current.includes(key) ? current.filter((item) => item !== key) : normalizeKeys([...current, key]));
@@ -347,10 +190,12 @@ function KeyBuilder({ onSubmit, protectedShortcut }: { onSubmit: (keys: string[]
     const isActive = keys.includes(key);
     return <button type="button" key={key} autoFocus={key === "Ctrl"} aria-pressed={isActive} className={`builder-key ${className} ${isActive ? "active" : ""}`} onClick={() => toggle(key)}>{prettyKey(key)}</button>;
   }
-  return <div className="key-builder" role="group" aria-label="Keyboard shortcut builder">
+  return <div className="key-builder" role="group" aria-label="Keyboard shortcut builder" onKeyDown={(event) => {
+    if (event.key === "Enter" && keys.length) { event.preventDefault(); event.stopPropagation(); onSubmit(keys); }
+  }}>
     <div className="builder-title"><span>{protectedShortcut ? "Safe practice builder" : "Build your chord"}</span><span>{keys.length ? chordLabel(keys) : "Select keys below"}</span></div>
     {protectedShortcut && <p className="builder-safety"><span>i</span> This chord is kept inside the app so it cannot trigger Windows or browser actions.</p>}
-    <p className="builder-controls"><kbd>Tab</kbd> move <kbd>Space</kbd> toggle <kbd>Enter</kbd> check</p>
+    <p className="builder-controls"><kbd>Tab</kbd> move · <kbd>Space</kbd> toggle · <kbd>Enter</kbd> check</p>
     <div className="keyboard-board">
       <div className="keyboard-row utility-row">{utilityKeys.map((key) => renderKey(key, "utility-key"))}</div>
       {alphaRows.map((row, index) => <div className={`keyboard-row alpha-row alpha-row-${index + 1}`} key={row[0]}>{row.map((key) => renderKey(key))}</div>)}

@@ -65,7 +65,7 @@ export function chordLabel(keys: string[]): string {
   return normalizeKeys(keys).join(" + ");
 }
 
-const browserSensitiveKeys = new Set(["H", "J", "L", "N", "T", "U", "W"]);
+const browserSensitiveKeys = new Set(["H", "J", "L", "N", "T", "U", "W", "P", "Tab", "I"]);
 
 /**
  * These combinations can affect the operating system or browser before a page

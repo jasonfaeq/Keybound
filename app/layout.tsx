@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Chord // Shortcut Trainer",
-  description: "Build keyboard shortcut fluency through quick, focused practice.",
+  title: "Chord // Keyboard Arcade",
+  description: "Turn Windows shortcuts into superpowers with quick rounds, daily challenges, combos, and saved progress.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
