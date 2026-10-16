@@ -17,7 +17,7 @@ export default function HomePage() {
   const today = dayKey();
   const href = `/practice?mode=${mode}${mode === "daily" || category === "all" ? "" : `&category=${category}`}`;
   return <main className="site-shell home-shell">
-    <header className="topbar"><Link href="/" className="brand" aria-label="Chord home"><span className="brand-mark">⌘</span><span>CHORD<span className="brand-slash">{"//"}</span></span></Link><span className="edition">THE KEYBOARD ARCADE</span><div className="player-chip"><span className="status-dot" /> LEVEL {level.level} <span className="chip-divider">/</span> {profile.xp.toLocaleString()} XP</div></header>
+    <header className="topbar"><Link href="/" className="brand" aria-label="Keybound home"><span className="brand-mark">⌘</span><span>KEYBOUND<span className="brand-slash">{"//"}</span></span></Link><span className="edition">THE KEYBOARD ARCADE</span><div className="player-chip"><span className="status-dot" /> LEVEL {level.level} <span className="chip-divider">/</span> {profile.xp.toLocaleString()} XP</div></header>
     <section className="arcade-hero">
       <div className="hero-copy"><p className="eyebrow"><span className="live-dot" /> A LITTLE PRACTICE. A LOT MORE POWER.</p><h1>Less clicking.<br /><em>More winning.</em></h1><p className="hero-description">Your keyboard has superpowers. Unlock them in quick, satisfying rounds that turn useful shortcuts into second nature.</p><div className="hero-actions"><Link href={href} className="button button-primary hero-play">Let’s play <span>↗</span></Link><span className="hero-aside">Small rounds. Real skills.<br /><span>Windows shortcuts · play in your browser</span></span></div></div>
       <div className="arcade-art" aria-label="Windows clipboard history shortcut: Win plus V"><div className="art-orbit orbit-a" /><div className="art-orbit orbit-b" /><span className="art-coordinate">INPUT_ / 001</span><span className="art-spark spark-one">✦</span><span className="art-spark spark-two">+</span><div className="art-key key-win">⊞<span>Win</span></div><span className="art-plus">+</span><div className="art-key key-v">V</div><div className="art-caption"><span className="status-dot" /> CLIPBOARD HISTORY UNLOCKED <span>↗</span></div><div className="art-sticker">GOODBYE,<br />RIGHT CLICK.</div><span className="art-bottom">BUILD MUSCLE MEMORY. KEEP THE HIGH SCORE.</span></div>
@@ -35,6 +35,6 @@ export default function HomePage() {
       { icon: "✦", name: "Muscle memory", goal: "Master 6 shortcuts", unlocked: mastered >= 6 },
       { icon: "◎", name: "Century club", goal: "Land 100 correct chords", unlocked: profile.totalCorrect >= 100 },
     ].map((badge) => <div key={badge.name} className={`trophy ${badge.unlocked ? "earned" : ""}`}><span className="trophy-icon">{badge.icon}</span><div><strong>{badge.name}</strong><span>{badge.goal}</span><small>{badge.unlocked ? "UNLOCKED ✓" : "LOCKED"}</small></div></div>)}</div></section>
-    <footer className="home-footer"><span>CHORD // BUILT FOR YOUR EVERYDAY SUPERPOWERS</span><span>Play a little. Remember a lot.</span></footer>
+    <footer className="home-footer"><span>KEYBOUND // BUILT FOR YOUR EVERYDAY SUPERPOWERS</span><span>Play a little. Remember a lot.</span></footer>
   </main>;
 }

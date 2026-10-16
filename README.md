@@ -1,4 +1,4 @@
-# Chord // The Keyboard Arcade
+# Keybound // The Keyboard Arcade
 
 A local-first Windows shortcut game built with Next.js 16 and React 19.
 
