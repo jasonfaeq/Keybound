@@ -3,8 +3,8 @@
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
-  useCallback,
   useEffect,
+  useEffectEvent,
   useMemo,
   useReducer,
   useRef,
@@ -12,31 +12,51 @@ import {
 } from "react";
 import { shortcuts } from "../data/shortcuts";
 import {
-  chordLabel,
+  allChords,
   chordsMatch,
   keyEventToChord,
+  matchesShortcut,
   normalizeKeys,
-  prettyKey,
   requiresBuilder,
+  shortcutRequiresBuilder,
 } from "../lib/shortcut";
 import {
   dayKey,
+  filterPool,
+  isFiniteMode,
   freshRun,
+  grade,
   levelFor,
+  makeChoices,
   makeDeck,
   MODES,
   recordAttempt,
   recordSession,
+  ROUND_LENGTH,
   runReducer,
+  TIERS,
+  BLITZ_MS,
   type GameMode,
+  type Tier,
 } from "../lib/game";
 import { readProfile, updateProfile, useProfile } from "../lib/profile";
-import { CATEGORY_LABELS, type ShortcutCategory } from "../types/shortcut";
+import {
+  CATEGORY_LABELS,
+  CATEGORY_META,
+  DIFFICULTY_LABELS,
+  type Shortcut,
+  type ShortcutCategory,
+} from "../types/shortcut";
+import { Brand } from "./brand";
+import { Chord, Keyboard, useHeldKeys, type KeyMark } from "./keyboard";
 
 export default function ShortcutTrainer() {
   const searchParams = useSearchParams();
   return <Game key={searchParams.toString()} searchParams={searchParams} />;
 }
+
+const multiplierFor = (streak: number) =>
+  Math.min(4, 1 + Math.floor(streak / 3));
 
 function Game({
   searchParams,
@@ -52,15 +72,18 @@ function Game({
     mode !== "daily" && Object.hasOwn(CATEGORY_LABELS, requestedCategory)
       ? (requestedCategory as ShortcutCategory)
       : "all";
+  const requestedTier = searchParams.get("tier") ?? "all";
+  const tier: Tier =
+    mode !== "daily" && Object.hasOwn(TIERS, requestedTier)
+      ? (requestedTier as Tier)
+      : "all";
   const pool = useMemo(
-    () =>
-      category === "all"
-        ? shortcuts
-        : shortcuts.filter((s) => s.category === category),
-    [category],
+    () => filterPool(shortcuts, category, tier),
+    [category, tier],
   );
   const [run, dispatch] = useReducer(runReducer, pool, freshRun);
-  const [showBuilder, setShowBuilder] = useState(false);
+  const [built, setBuilt] = useState<string[]>([]);
+  const [picked, setPicked] = useState<string | null>(null);
   const [autoNext, setAutoNext] = useState(mode === "timed");
   const { profile, saved } = useProfile();
   const mainRef = useRef<HTMLElement>(null);
@@ -70,19 +93,49 @@ function Game({
   const savedSession = useRef(false);
   const sessionDay = useRef("");
   const [previousBest, setPreviousBest] = useState(0);
+
   const question = run.deck[run.index];
   const result = run.phase === "result" ? run.attempts.at(-1) : undefined;
-  const builderRequired = requiresBuilder(question.expected);
-  const builderVisible = showBuilder || builderRequired;
-  const correct = run.attempts.filter((a) => a.correct).length;
+  const isDecode = mode === "decode";
+  const protectedPrompt = !isDecode && shortcutRequiresBuilder(question);
+  const playing = run.phase === "playing" && !run.paused;
+  const held = useHeldKeys(run.phase === "playing" && !isDecode);
+  const finite = isFiniteMode(mode);
+  const correctCount = run.attempts.filter((a) => a.correct).length;
+  const accuracy = correctCount / Math.max(1, run.attempts.length);
   const flawless =
-    correct > 0 && run.attempts.every((a) => a.correct && !a.assisted);
-  const finite = ["practice", "daily", "review"].includes(mode);
+    correctCount > 0 && run.attempts.every((a) => a.correct && !a.assisted);
   const level = levelFor(profile.xp);
   const timeLeft = Math.ceil(run.remaining / 1000);
   const nextFinishes =
-    (finite && run.attempts.length >= 10) ||
+    (finite && run.attempts.length >= ROUND_LENGTH) ||
     (mode === "survival" && run.lives <= 0);
+  const multiplier = multiplierFor(run.streak);
+  const meta = CATEGORY_META[question.category];
+  const choices = useMemo(
+    () =>
+      isDecode
+        ? makeChoices(
+            question,
+            pool,
+            `${question.id}:${run.index}:${run.deck.length}`,
+          )
+        : [],
+    [isDecode, question, pool, run.index, run.deck.length],
+  );
+  // The 50/50 hint in Decode hides two wrong answers.
+  const hiddenChoices = useMemo(
+    () =>
+      new Set(
+        run.hint > 0
+          ? choices
+              .filter((c) => c.id !== question.id)
+              .slice(0, 2)
+              .map((c) => c.id)
+          : [],
+      ),
+    [choices, question.id, run.hint],
+  );
   const missed = [
     ...new Map(
       run.attempts
@@ -91,32 +144,39 @@ function Game({
     ).values(),
   ];
 
-  const playSound = useCallback((good: boolean) => {
+  function playSound(kind: "good" | "bad" | "combo") {
     if (!readProfile().sound || !window.AudioContext) return;
     try {
       const context = audioRef.current ?? new AudioContext();
       audioRef.current = context;
       if (context.state === "suspended") void context.resume().catch(() => {});
-      (good ? [523.25, 659.25, 783.99] : [196, 164.81]).forEach(
-        (frequency, i) => {
-          const oscillator = context.createOscillator();
-          const gain = context.createGain();
-          const start = context.currentTime + i * 0.055;
-          oscillator.type = "triangle";
-          oscillator.frequency.value = frequency;
-          gain.gain.setValueAtTime(0.0001, start);
-          gain.gain.exponentialRampToValueAtTime(0.07, start + 0.01);
-          gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.25);
-          oscillator.connect(gain);
-          gain.connect(context.destination);
-          oscillator.start(start);
-          oscillator.stop(start + 0.26);
-        },
-      );
+      const notes = {
+        good: [659.25, 987.77],
+        bad: [220, 174.61],
+        combo: [523.25, 659.25, 783.99, 1046.5],
+      }[kind];
+      notes.forEach((frequency, i) => {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const start =
+          context.currentTime + i * (kind === "combo" ? 0.06 : 0.07);
+        oscillator.type = kind === "bad" ? "triangle" : "sine";
+        oscillator.frequency.value = frequency;
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(
+          kind === "bad" ? 0.09 : 0.06,
+          start + 0.012,
+        );
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.3);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(start);
+        oscillator.stop(start + 0.32);
+      });
     } catch {
       /* Audio is optional; the round continues if the browser blocks it. */
     }
-  }, []);
+  }
 
   useEffect(
     () => () => {
@@ -151,18 +211,20 @@ function Game({
           mode,
           run.score,
           sessionDay.current,
-          run.attempts.length >= 10,
+          run.attempts.length >= ROUND_LENGTH,
         ),
       );
     }
   }, [run.attempts, run.bestStreak, run.phase, run.score, mode]);
 
-  const start = useCallback(() => {
+  const refocus = () => mainRef.current?.focus({ preventScroll: true });
+  function start() {
     savedAttempts.current = 0;
     savedSession.current = false;
     sessionDay.current = dayKey();
     setPreviousBest(readProfile().best[mode] ?? 0);
-    setShowBuilder(false);
+    setBuilt([]);
+    setPicked(null);
     dispatch({
       type: "start",
       deck: makeDeck(pool, mode, readProfile(), sessionDay.current),
@@ -170,32 +232,53 @@ function Game({
     });
     mainRef.current?.focus({ preventScroll: true });
     window.scrollTo({ top: 0, behavior: "instant" });
-  }, [mode, pool]);
-  const next = useCallback(() => {
-    setShowBuilder(false);
+  }
+  function next() {
+    setBuilt([]);
+    setPicked(null);
     const deck = makeDeck(pool, mode, readProfile(), sessionDay.current);
     // Avoid a repeated question at the boundary between shuffled decks.
     if (deck.length > 1 && deck[0].id === question.id)
       [deck[0], deck[1]] = [deck[1], deck[0]];
-    dispatch({ type: "next", deck, mode, now: Date.now() });
+    dispatch({
+      type: "next",
+      deck,
+      mode,
+      now: Date.now(),
+      requeue: mode !== "daily",
+    });
     mainRef.current?.focus({ preventScroll: true });
-    window.scrollTo({ top: 0, behavior: "instant" });
-  }, [mode, pool, question.id]);
-  const submit = useCallback(
-    (keys: string[]) => {
-      if (run.phase !== "playing" || run.paused) return;
-      const good = chordsMatch(keys, question.expected);
-      if (mode !== "timed" || Date.now() < run.deadline) playSound(good);
-      dispatch({
-        type: "answer",
-        correct: good,
-        keys: normalizeKeys(keys),
-        mode,
-        now: Date.now(),
-      });
-    },
-    [mode, playSound, question.expected, run.deadline, run.paused, run.phase],
-  );
+  }
+  function answer(good: boolean, keys: string[]) {
+    if (!playing) return;
+    if (mode !== "timed" || Date.now() < run.deadline) {
+      const streak = good && !run.hint ? run.streak + 1 : 0;
+      playSound(
+        good ? (streak > 0 && streak % 3 === 0 ? "combo" : "good") : "bad",
+      );
+    }
+    dispatch({
+      type: "answer",
+      correct: good,
+      keys: normalizeKeys(keys),
+      mode,
+      now: Date.now(),
+    });
+  }
+  const submit = (keys: string[]) =>
+    answer(matchesShortcut(keys, question), keys);
+  function pick(choice: Shortcut) {
+    if (!playing || hiddenChoices.has(choice.id)) return;
+    setPicked(choice.id);
+    answer(choice.id === question.id, question.expected);
+  }
+  function toggleKey(key: string) {
+    setBuilt((current) =>
+      current.includes(key)
+        ? current.filter((item) => item !== key)
+        : normalizeKeys([...current, key]),
+    );
+  }
 
   useEffect(() => {
     if (
@@ -211,11 +294,12 @@ function Game({
     );
     return () => window.clearInterval(timer);
   }, [mode, run.paused, run.phase]);
+  const advance = useEffectEvent(() => next());
   useEffect(() => {
     if (!autoNext || run.phase !== "result" || run.paused) return;
-    const timer = window.setTimeout(next, result?.correct ? 1100 : 2200);
+    const timer = window.setTimeout(advance, result?.correct ? 900 : 2400);
     return () => window.clearTimeout(timer);
-  }, [autoNext, next, result?.correct, run.paused, run.phase]);
+  }, [autoNext, result?.correct, run.paused, run.phase]);
   useEffect(() => {
     if (run.phase === "result" || run.phase === "finished" || run.paused)
       actionRef.current?.focus({ preventScroll: true });
@@ -229,90 +313,122 @@ function Game({
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
   }, []);
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.repeat || event.isComposing) return;
-      const target = event.target instanceof HTMLElement ? event.target : null;
-      const interactive = target?.closest("button, a, select, input, textarea");
-      if (
-        event.key === "Escape" &&
-        run.phase !== "ready" &&
-        run.phase !== "finished"
-      ) {
-        event.preventDefault();
-        dispatch({ type: run.paused ? "resume" : "pause", now: Date.now() });
-        return;
-      }
-      if (interactive) return;
-      if (run.paused) return;
-      if (run.phase === "ready" || run.phase === "finished") {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          start();
-        }
-        return;
-      }
-      if (run.phase === "result") {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          next();
-        }
-        return;
-      }
-      // Tab always remains available for navigating the interface.
-      if (
-        event.key === "Tab" &&
-        !event.ctrlKey &&
-        !event.altKey &&
-        !event.metaKey
-      )
-        return;
-      if (
-        builderRequired ||
-        builderVisible ||
-        ["Control", "Alt", "Shift", "Meta"].includes(event.key)
-      )
-        return;
-      const keys = keyEventToChord(event);
-      if (requiresBuilder(keys)) return;
+  const onKey = useEffectEvent((event: KeyboardEvent) => {
+    if (event.isComposing) return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const interactive = target?.closest(
+      "button, a, select, input, textarea, label",
+    );
+    if (
+      event.key === "Escape" &&
+      !event.repeat &&
+      run.phase !== "ready" &&
+      run.phase !== "finished"
+    ) {
       event.preventDefault();
-      submit(keys);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [
-    builderRequired,
-    builderVisible,
-    next,
-    run.paused,
-    run.phase,
-    start,
-    submit,
-  ]);
+      dispatch({ type: run.paused ? "resume" : "pause", now: Date.now() });
+      if (run.paused) mainRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (interactive || run.paused || event.repeat) return;
+    const plain =
+      !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey;
+    if (run.phase === "ready" || run.phase === "finished") {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        start();
+      }
+      return;
+    }
+    if (run.phase === "result") {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        next();
+      }
+      return;
+    }
+    if (isDecode) {
+      const index = Number(event.key) - 1;
+      if (plain && index >= 0 && index < choices.length) {
+        event.preventDefault();
+        pick(choices[index]);
+      }
+      return;
+    }
+    if (built.length && plain && event.key === "Enter") {
+      event.preventDefault();
+      submit(built);
+      return;
+    }
+    if (built.length && plain && event.key === "Backspace") {
+      event.preventDefault();
+      setBuilt((current) => current.slice(0, -1));
+      return;
+    }
+    // Tab always remains available for navigating the interface.
+    if (event.key === "Tab" && !event.ctrlKey) return;
+    if (
+      protectedPrompt ||
+      ["Control", "Alt", "Shift", "Meta", "OS"].includes(event.key)
+    )
+      return;
+    const keys = keyEventToChord(event);
+    if (requiresBuilder(keys)) return;
+    event.preventDefault();
+    submit(keys);
+  });
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => onKey(event);
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, []);
+
+  const marks: Record<string, KeyMark> = {};
+  if (isDecode) {
+    for (const key of question.expected)
+      marks[key] = result ? (result.correct ? "correct" : "answer") : "hint";
+  } else if (result) {
+    for (const key of question.expected) marks[key] = "answer";
+    for (const key of run.captured)
+      marks[key] = result.correct
+        ? "correct"
+        : question.expected.includes(key)
+          ? "answer"
+          : "wrong";
+  } else if (run.hint) {
+    for (const key of run.hint >= 2
+      ? question.expected
+      : question.expected.slice(0, 1))
+      marks[key] = "hint";
+  }
+
+  const setLabel = `${category === "all" ? "All categories" : CATEGORY_LABELS[category]} · ${TIERS[tier].name}`;
 
   return (
-    <main className="practice-shell" ref={mainRef} tabIndex={-1}>
-      <header className="practice-topbar">
-        <Link href="/" className="brand" aria-label="Keybound home">
-          <span className="brand-mark">⌘</span>
+    <main
+      className={`game-shell ${result ? (result.correct ? "flash-good" : "flash-bad") : ""}`}
+      ref={mainRef}
+      tabIndex={-1}
+    >
+      <header className="hud">
+        <Brand />
+        <div className="hud-mode">
+          <span className="hud-mode-icon" aria-hidden="true">
+            {MODES[mode].icon}
+          </span>
           <span>
-            KEYBOUND<span className="brand-slash">{"//"}</span>
+            <strong>{MODES[mode].name}</strong>
+            <small>{setLabel}</small>
           </span>
-        </Link>
-        <div className="practice-nav">
-          <span className="session-label">
-            {MODES[mode].name.toUpperCase()}
-          </span>
-          <span className="session-stat">
-            {run.score.toLocaleString()} <small>PTS</small>
-          </span>
+        </div>
+        <div className="hud-stats">
           {mode === "survival" && (
             <span
-              className="lives"
+              className="hud-lives"
               aria-label={`${Math.max(0, run.lives)} lives left`}
             >
               {[0, 1, 2].map((i) => (
-                <span key={i} className={i < run.lives ? "" : "lost-life"}>
+                <span key={i} className={i < run.lives ? "" : "lost"}>
                   ♥
                 </span>
               ))}
@@ -320,67 +436,470 @@ function Game({
           )}
           {mode === "timed" && (
             <span
-              className={`timer-stat ${timeLeft <= 10 ? "timer-warning" : ""}`}
+              className={`hud-timer ${timeLeft <= 10 && run.phase !== "ready" ? "urgent" : ""}`}
             >
-              ◷ {timeLeft}s
+              {timeLeft}
+              <small>s</small>
             </span>
           )}
+          <span className="hud-score" aria-label={`${run.score} points`}>
+            <span key={run.score} className="hud-score-value">
+              {run.score.toLocaleString()}
+            </span>
+            <small>pts</small>
+          </span>
           <button
-            className="sound-toggle"
+            className="icon-button"
             onClick={() => updateProfile((p) => ({ ...p, sound: !p.sound }))}
-            aria-label={profile.sound ? "Mute sounds" : "Enable sounds"}
+            aria-label={profile.sound ? "Mute sounds" : "Turn sounds on"}
+            title={profile.sound ? "Mute sounds" : "Turn sounds on"}
           >
-            {profile.sound ? "SOUND ON" : "SOUND OFF"}
+            {profile.sound ? "🔊" : "🔇"}
           </button>
+          {(run.phase === "playing" || run.phase === "result") && (
+            <button
+              className="icon-button"
+              onClick={() => dispatch({ type: "pause", now: Date.now() })}
+              aria-label="Pause"
+              title="Pause (Esc)"
+            >
+              ❚❚
+            </button>
+          )}
         </div>
       </header>
-      <div className="practice-layout">
-        <aside className="practice-sidebar">
-          <Link href="/" className="back-link">
-            ← THE ARCADE
-          </Link>
-          <div className="run-mode-icon">{MODES[mode].icon}</div>
-          <h2>{MODES[mode].name}</h2>
-          <p className="sidebar-description">{MODES[mode].description}</p>
-          <span className="sidebar-set">
-            {category === "all" ? "All shortcuts" : CATEGORY_LABELS[category]}
-          </span>
-          <div className="sidebar-progress">
-            <div className="progress-heading">
-              <span>
-                {finite
-                  ? "ROUND PROGRESS"
-                  : mode === "timed"
-                    ? "TIME LEFT"
-                    : "CHORDS PLAYED"}
-              </span>
-              <strong>
-                {finite
-                  ? `${run.attempts.length} / 10`
-                  : mode === "timed"
-                    ? `${timeLeft}s`
-                    : run.attempts.length}
-              </strong>
-            </div>
-            <div className="progress-track">
+      {mode === "timed" ? (
+        <div className="round-bar" aria-hidden="true">
+          <span
+            className={timeLeft <= 10 ? "urgent" : ""}
+            style={{ width: `${(run.remaining / BLITZ_MS) * 100}%` }}
+          />
+        </div>
+      ) : finite ? (
+        <div className="round-steps" aria-hidden="true">
+          {Array.from({ length: ROUND_LENGTH }, (_, i) => {
+            const attempt = run.attempts[i];
+            return (
               <span
-                style={{
-                  width: `${finite ? run.attempts.length * 10 : mode === "timed" ? (timeLeft / 60) * 100 : 100}%`,
-                }}
+                key={i}
+                className={
+                  attempt
+                    ? attempt.correct
+                      ? attempt.assisted
+                        ? "step-assisted"
+                        : "step-good"
+                      : "step-bad"
+                    : i === run.attempts.length && run.phase === "playing"
+                      ? "step-current"
+                      : ""
+                }
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <div className="round-bar round-bar-idle" aria-hidden="true" />
+      )}
+
+      <div className="arena">
+        {run.phase === "ready" ? (
+          <section className="stage ready-stage">
+            <div className="ready-emblem" aria-hidden="true">
+              <span className="cap cap-hero">{MODES[mode].icon}</span>
+            </div>
+            <p className="eyebrow">
+              {mode === "daily" ? `Daily mix · ${dayKey()}` : setLabel}
+            </p>
+            <h1 className="display">
+              {mode === "survival"
+                ? "Three lives. Make them count."
+                : mode === "timed"
+                  ? "Sixty seconds. Go fast."
+                  : mode === "decode"
+                    ? "Read the keys. Name the move."
+                    : mode === "review"
+                      ? "Turn misses into muscle memory."
+                      : "Let’s make it automatic."}
+            </h1>
+            <p className="lede">
+              {MODES[mode].description} {MODES[mode].detail}. {pool.length}{" "}
+              shortcuts in this set.
+            </p>
+            <div className="ready-rules">
+              <div>
+                <span className="cap cap-sm">↵</span>
+                {mode === "decode"
+                  ? "Pick an answer with 1–4 or a click"
+                  : "Press the real shortcut to answer"}
+              </div>
+              <div>
+                <span className="cap cap-sm">⊞</span>
+                Protected chords (Win, Alt, F-keys) are clicked on the on-screen
+                keyboard
+              </div>
+              <div>
+                <span className="cap cap-sm">×3</span>
+                Three clean answers in a row raise your multiplier, up to ×4
+              </div>
+            </div>
+            <button
+              ref={actionRef}
+              className="button button-primary button-lg"
+              onClick={start}
+            >
+              Start round <span aria-hidden="true">→</span>
+            </button>
+            <span className="key-hint">
+              <kbd>Enter</kbd> start · <kbd>Esc</kbd> pause
+            </span>
+          </section>
+        ) : run.phase === "finished" ? (
+          <Summary
+            run={run}
+            mode={mode}
+            category={category}
+            tier={tier}
+            accuracy={accuracy}
+            flawless={flawless}
+            correctCount={correctCount}
+            previousBest={previousBest}
+            missed={missed}
+            onRestart={start}
+          />
+        ) : (
+          <section
+            className={`stage play-stage ${result ? (result.correct ? "is-good" : "is-bad") : ""}`}
+          >
+            {run.paused && (
+              <div
+                className="pause-overlay"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Round paused"
+              >
+                <span className="cap cap-hero" aria-hidden="true">
+                  ❚❚
+                </span>
+                <h2 className="display">Paused</h2>
+                <p>Your timer is frozen. Take a breath.</p>
+                <button
+                  ref={actionRef}
+                  className="button button-primary"
+                  onClick={() => {
+                    dispatch({ type: "resume", now: Date.now() });
+                    refocus();
+                  }}
+                >
+                  Resume <span aria-hidden="true">→</span>
+                </button>
+                <div className="pause-links">
+                  <button
+                    className="text-button"
+                    onClick={() => dispatch({ type: "finish" })}
+                  >
+                    End round
+                  </button>
+                  <Link href="/" className="text-button">
+                    Back to menu
+                  </Link>
+                </div>
+              </div>
+            )}
+            <div className="play-card" inert={run.paused}>
+              <div className="prompt-meta">
+                <span className={`pill tone-${meta.color}`}>
+                  <span aria-hidden="true">{meta.icon}</span>
+                  {meta.app}
+                </span>
+                <span className={`pill pill-quiet diff-${question.difficulty}`}>
+                  {DIFFICULTY_LABELS[question.difficulty]}
+                </span>
+                <span className="prompt-count">
+                  {String(run.attempts.length + (result ? 0 : 1)).padStart(
+                    2,
+                    "0",
+                  )}
+                  {finite ? ` / ${ROUND_LENGTH}` : ""}
+                </span>
+              </div>
+
+              {result && (
+                <span
+                  key={run.attempts.length}
+                  className={`score-pop ${result.correct ? "" : "score-pop-miss"}`}
+                  aria-hidden="true"
+                >
+                  {result.correct ? `+${result.points}` : "miss"}
+                </span>
+              )}
+
+              {isDecode ? (
+                <div className="prompt" key={`${question.id}-${run.index}`}>
+                  <p className="kicker">What does this do?</p>
+                  <div className="decode-chord">
+                    <Chord
+                      keys={question.expected}
+                      size="xl"
+                      state={
+                        result
+                          ? result.correct
+                            ? "correct"
+                            : "wrong"
+                          : undefined
+                      }
+                    />
+                  </div>
+                  <span className="decode-app">in {meta.app}</span>
+                  <div className="choices" role="group" aria-label="Answers">
+                    {choices.map((choice, i) => {
+                      const state = result
+                        ? choice.id === question.id
+                          ? "choice-right"
+                          : choice.id === picked
+                            ? "choice-wrong"
+                            : "choice-dim"
+                        : hiddenChoices.has(choice.id)
+                          ? "choice-hidden"
+                          : "";
+                      return (
+                        <button
+                          key={choice.id}
+                          className={`choice ${state}`}
+                          disabled={!playing || hiddenChoices.has(choice.id)}
+                          onClick={() => pick(choice)}
+                        >
+                          <span className="choice-num">{i + 1}</span>
+                          {choice.action}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="prompt" key={`${question.id}-${run.index}`}>
+                  <p className="kicker">
+                    {protectedPrompt ? (
+                      <>
+                        <span className="lock" aria-hidden="true">
+                          ◈
+                        </span>{" "}
+                        Protected · click the keys below
+                      </>
+                    ) : (
+                      "Press the shortcut to"
+                    )}
+                  </p>
+                  <h1 className="prompt-action">{question.action}</h1>
+                  <div className="answer-slot" aria-live="polite">
+                    {result ? (
+                      run.captured.length ? (
+                        <Chord
+                          keys={run.captured}
+                          size="lg"
+                          state={result.correct ? "correct" : "wrong"}
+                        />
+                      ) : (
+                        <span className="slot-note">Skipped</span>
+                      )
+                    ) : built.length ? (
+                      <Chord keys={built} size="lg" />
+                    ) : held.length && !protectedPrompt ? (
+                      <Chord keys={held} size="lg" state="ghost" />
+                    ) : run.hint ? (
+                      <Chord
+                        keys={
+                          run.hint >= 2
+                            ? question.expected
+                            : question.expected.slice(0, 1)
+                        }
+                        placeholders={
+                          run.hint >= 2 ? 0 : question.expected.length - 1
+                        }
+                        size="lg"
+                        state="hint"
+                      />
+                    ) : (
+                      <span className="slot-note">
+                        <span className="caret" />
+                        {protectedPrompt
+                          ? "Build the chord on the keyboard"
+                          : "Waiting for your keys"}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {result && (
+                <div
+                  className={`feedback ${result.correct ? "feedback-good" : "feedback-bad"}`}
+                  role="status"
+                >
+                  <span className="feedback-icon" aria-hidden="true">
+                    {result.correct ? "✓" : "×"}
+                  </span>
+                  <div className="feedback-body">
+                    <strong>
+                      {result.correct
+                        ? result.assisted
+                          ? "Got there with a hint."
+                          : run.streak >= 9
+                            ? "Unstoppable."
+                            : run.streak >= 3
+                              ? "You’re in the zone."
+                              : "Locked in."
+                        : isDecode
+                          ? `That was “${question.action}”.`
+                          : "Not quite. Here’s the move:"}
+                    </strong>
+                    {!result.correct && !isDecode && (
+                      <Chord
+                        keys={question.expected}
+                        size="sm"
+                        state="correct"
+                      />
+                    )}
+                    {!isDecode &&
+                      allChords(question)
+                        .filter(
+                          (chord) =>
+                            !chordsMatch(
+                              chord,
+                              result.correct ? run.captured : question.expected,
+                            ),
+                        )
+                        .slice(0, 2)
+                        .map((chord) => (
+                          <span className="also" key={chord.join("+")}>
+                            also <Chord keys={chord} size="sm" />
+                          </span>
+                        ))}
+                  </div>
+                  <div className="feedback-tags">
+                    {result.correct && !result.assisted && result.speed > 0 && (
+                      <span className="tag tag-speed">
+                        ⚡ {result.speed === 50 ? "Lightning" : "Quick"}
+                      </span>
+                    )}
+                    {result.correct && !result.assisted && multiplier > 1 && (
+                      <span className="tag tag-combo">×{multiplier}</span>
+                    )}
+                    <span className="tag">{result.seconds.toFixed(1)}s</span>
+                  </div>
+                </div>
+              )}
+              {result && question.tip && (
+                <p className="tip">
+                  <span>Pro tip</span>
+                  {question.tip}
+                </p>
+              )}
+
+              <div className="play-controls">
+                {result ? (
+                  <>
+                    <button
+                      ref={actionRef}
+                      className="button button-primary"
+                      onClick={next}
+                    >
+                      {nextFinishes ? "See results" : "Next"}{" "}
+                      <span aria-hidden="true">→</span>
+                    </button>
+                    <span className="key-hint">
+                      {autoNext ? "Auto-advancing · " : ""}
+                      <kbd>Enter</kbd> continue
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    {!isDecode && built.length > 0 && (
+                      <button
+                        className="button button-primary"
+                        onClick={() => {
+                          submit(built);
+                          refocus();
+                        }}
+                      >
+                        Check <kbd>Enter</kbd>
+                      </button>
+                    )}
+                    {!isDecode && built.length > 0 && (
+                      <button
+                        className="button button-ghost"
+                        onClick={() => {
+                          setBuilt([]);
+                          refocus();
+                        }}
+                      >
+                        Clear
+                      </button>
+                    )}
+                    <button
+                      className="button button-ghost"
+                      disabled={run.hint >= (isDecode ? 1 : 2)}
+                      onClick={() => {
+                        dispatch({ type: "hint", max: isDecode ? 1 : 2 });
+                        refocus();
+                      }}
+                    >
+                      {isDecode
+                        ? run.hint
+                          ? "50/50 used"
+                          : "50/50 hint"
+                        : run.hint === 0
+                          ? "Hint"
+                          : run.hint === 1
+                            ? "Reveal all"
+                            : "Revealed"}
+                    </button>
+                    <button
+                      className="button button-ghost"
+                      onClick={() => {
+                        if (isDecode) {
+                          setPicked(null);
+                          answer(false, []);
+                        } else submit([]);
+                        refocus();
+                      }}
+                    >
+                      Skip
+                    </button>
+                    <span className="key-hint key-hint-end">
+                      {run.hint > 0 && "Hints earn fewer points · "}
+                      <kbd>Esc</kbd> pause
+                    </span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="board" inert={run.paused}>
+              <Keyboard
+                selected={result ? [] : built}
+                held={result ? [] : held}
+                marks={marks}
+                onToggle={playing && !isDecode ? toggleKey : undefined}
+                label={
+                  isDecode
+                    ? "Keyboard showing the shortcut"
+                    : "On-screen keyboard. Select keys to build a shortcut, then press Enter."
+                }
               />
             </div>
-          </div>
+          </section>
+        )}
+
+        <aside className="rail" aria-label="Round stats">
           <div
-            className={`combo-meter ${run.streak >= 3 ? "combo-active" : ""}`}
+            className={`rail-card combo ${run.streak >= 3 ? "combo-hot" : ""}`}
           >
-            <span className="micro-label">
-              {run.streak >= 3 ? "YOU’RE ON FIRE" : "FIND YOUR FLOW"}
-            </span>
-            <div>
-              <strong>×{Math.min(4, 1 + Math.floor(run.streak / 3))}</strong>
-              <span>{run.streak} combo</span>
+            <span className="rail-label">Combo</span>
+            <div className="combo-value">
+              <strong>×{multiplier}</strong>
+              <span>{run.streak} in a row</span>
             </div>
-            <div className="combo-pips">
+            <div className="combo-pips" aria-hidden="true">
               {[0, 1, 2].map((i) => (
                 <span
                   key={i}
@@ -390,502 +909,211 @@ function Game({
             </div>
             <small>
               {run.streak >= 9
-                ? "Maximum multiplier. Keep it going!"
-                : `${3 - (run.streak % 3)} clean answers to the next multiplier`}
+                ? "Max multiplier. Don’t drop it."
+                : `${3 - (run.streak % 3)} more for ×${Math.min(4, multiplier + 1)}`}
             </small>
           </div>
-          <label className="auto-next">
+          <div className="rail-card rail-stats">
+            <div>
+              <strong>{correctCount}</strong>
+              <span>correct</span>
+            </div>
+            <div>
+              <strong>{Math.round(accuracy * 100)}%</strong>
+              <span>accuracy</span>
+            </div>
+            <div>
+              <strong>{run.bestStreak}</strong>
+              <span>best combo</span>
+            </div>
+          </div>
+          {run.attempts.length > 0 && (
+            <div className="rail-card recent">
+              <span className="rail-label">Recent</span>
+              <ol>
+                {run.attempts
+                  .slice(-6)
+                  .reverse()
+                  .map((attempt, i) => (
+                    <li
+                      key={run.attempts.length - i}
+                      className={attempt.correct ? "good" : "bad"}
+                    >
+                      <span className="recent-mark" aria-hidden="true">
+                        {attempt.correct ? "✓" : "×"}
+                      </span>
+                      <span className="recent-action">
+                        {attempt.shortcut.action}
+                      </span>
+                      <Chord keys={attempt.shortcut.expected} size="sm" />
+                    </li>
+                  ))}
+              </ol>
+            </div>
+          )}
+          <label className="switch">
             <input
               type="checkbox"
               checked={autoNext}
-              onChange={(e) => setAutoNext(e.target.checked)}
-            />{" "}
-            Auto advance
+              onChange={(e) => {
+                setAutoNext(e.target.checked);
+                refocus();
+              }}
+            />
+            <span className="switch-track" aria-hidden="true" />
+            Auto-advance
           </label>
-          <div className="sidebar-note">
-            <span className="note-icon">i</span>
-            <p>
-              <strong>Make it stick</strong>Three correct recalls without hints
-              master a shortcut. Hints earn less XP and reset its mastery
-              streak.
-            </p>
-          </div>
-          <span className="sidebar-save">
+          <p className="rail-note">
             {saved
-              ? `LEVEL ${level.level} · ${profile.xp} XP · SAVED LOCALLY`
-              : "STORAGE UNAVAILABLE · THIS VISIT ONLY"}
-          </span>
+              ? `Level ${level.level} · ${level.title} · ${profile.xp.toLocaleString()} XP`
+              : "Storage unavailable · progress lasts this visit"}
+          </p>
         </aside>
-
-        {run.phase === "ready" ? (
-          <section className="practice-card ready-card">
-            <span className="question-number">
-              YOUR NEXT GOOD HABIT STARTS HERE
-            </span>
-            <div className="ready-emblem">{MODES[mode].icon}</div>
-            <p className="eyebrow">
-              {mode === "daily"
-                ? "TODAY’S SHARED CHALLENGE"
-                : "READY WHEN YOU ARE"}
-            </p>
-            <h1>
-              {mode === "survival"
-                ? "Three lives.\nMake them count."
-                : mode === "timed"
-                  ? "60 seconds.\nFind your flow."
-                  : "Let’s make\nit automatic."}
-            </h1>
-            <p>
-              {MODES[mode].detail}. Correct answers build combos and XP. Use the
-              on-screen keyboard for protected shortcuts.
-            </p>
-            <button
-              ref={actionRef}
-              className="button button-primary"
-              onClick={start}
-            >
-              Start round <span>→</span>
-            </button>
-            <span className="ready-hint">
-              <kbd>Enter</kbd> start · <kbd>Esc</kbd> pause during play
-            </span>
-          </section>
-        ) : run.phase === "finished" ? (
-          <section className="practice-card session-summary">
-            <div className="practice-card-header">
-              <span className="question-number">
-                {finite && run.attempts.length < 10
-                  ? "ROUND ENDED"
-                  : "ROUND COMPLETE"}
-              </span>
-              <span className="category-badge">+{run.xp} XP</span>
-            </div>
-            <div className="summary-copy">
-              <div className="summary-medal">
-                {flawless
-                  ? "✦"
-                  : correct / Math.max(1, run.attempts.length) >= 0.7
-                    ? "↗"
-                    : "◎"}
-              </div>
-              <p className="eyebrow">
-                {run.score > previousBest
-                  ? "NEW PERSONAL BEST"
-                  : "EVERY REP IS PROGRESS"}
-              </p>
-              <h1>
-                {flawless
-                  ? "Flawless flow."
-                  : correct / Math.max(1, run.attempts.length) >= 0.7
-                    ? "Nicely played."
-                    : "You’re building it."}
-              </h1>
-              <p className="question-subtitle">
-                {run.attempts.length
-                  ? `${correct} of ${run.attempts.length} chords landed. ${missed.length ? "Let’s give the tricky ones another go." : "That’s useful muscle memory."}`
-                  : "A fresh round is one click away."}
-              </p>
-            </div>
-            <div className="summary-stats">
-              <div>
-                <strong>{run.score.toLocaleString()}</strong>
-                <span>points</span>
-              </div>
-              <div>
-                <strong>
-                  {Math.round(
-                    (correct / Math.max(1, run.attempts.length)) * 100,
-                  )}
-                  %
-                </strong>
-                <span>accuracy</span>
-              </div>
-              <div>
-                <strong>{run.bestStreak}</strong>
-                <span>best combo</span>
-              </div>
-            </div>
-            {missed.length > 0 && (
-              <div className="review-list">
-                <span className="micro-label">TAKE THESE WITH YOU</span>
-                {missed.map((s) => (
-                  <div key={s.id}>
-                    <span>{s.action}</span>
-                    <kbd>{chordLabel(s.expected)}</kbd>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="practice-card-footer summary-footer">
-              <button
-                ref={actionRef}
-                className="button button-primary"
-                onClick={start}
-              >
-                Play again <span>↻</span>
-              </button>
-              <Link
-                className="button button-secondary"
-                href={
-                  missed.length
-                    ? `/practice?mode=review${category === "all" ? "" : `&category=${category}`}`
-                    : "/"
-                }
-              >
-                {missed.length ? "Practice weak spots" : "Back to arcade"}{" "}
-                <span>→</span>
-              </Link>
-            </div>
-          </section>
-        ) : (
-          <section
-            className={`practice-card play-card ${result ? (result.correct ? "has-correct" : "has-incorrect") : ""}`}
-          >
-            {run.paused && (
-              <div
-                className="pause-overlay"
-                role="dialog"
-                aria-modal="true"
-                aria-label="Round paused"
-              >
-                <span className="eyebrow">TAKE A BREATH</span>
-                <h2>Flow on hold.</h2>
-                <p>Your round is paused. Come back when you’re ready.</p>
-                <button
-                  ref={actionRef}
-                  className="button button-primary"
-                  onClick={() => {
-                    dispatch({ type: "resume", now: Date.now() });
-                    mainRef.current?.focus();
-                  }}
-                >
-                  Resume round <span>→</span>
-                </button>
-                <Link href="/" className="back-link">
-                  Back to arcade
-                </Link>
-              </div>
-            )}
-            <div inert={run.paused}>
-              <div className="practice-card-header">
-                <span className="question-number">
-                  CHORD{" "}
-                  {String(run.attempts.length + (result ? 0 : 1)).padStart(
-                    2,
-                    "0",
-                  )}
-                  {finite ? " / 10" : ""}
-                </span>
-                <span className="category-badge">
-                  {CATEGORY_LABELS[question.category]}
-                </span>
-              </div>
-              <div
-                className="round-dots"
-                aria-label={`${run.attempts.length} answered`}
-              >
-                {(finite
-                  ? Array.from({ length: 10 })
-                  : run.attempts.slice(-15)
-                ).map((_, i) => (
-                  <span
-                    key={i}
-                    className={
-                      run.attempts[
-                        finite ? i : Math.max(0, run.attempts.length - 15) + i
-                      ]
-                        ? run.attempts[
-                            finite
-                              ? i
-                              : Math.max(0, run.attempts.length - 15) + i
-                          ].correct
-                          ? "dot-correct"
-                          : "dot-incorrect"
-                        : i === run.attempts.length
-                          ? "dot-current"
-                          : ""
-                    }
-                  />
-                ))}
-              </div>
-              {result?.correct && run.streak > 0 && run.streak % 3 === 0 && (
-                <div className="combo-toast" role="status">
-                  ϟ {run.streak} COMBO · ×
-                  {Math.min(4, 1 + Math.floor(run.streak / 3))}{" "}
-                  {run.streak <= 9 ? "UNLOCKED" : "FLOW"}
-                </div>
-              )}
-              <div className="question-content" key={question.id}>
-                <p className="question-kicker">
-                  {question.difficulty === "stretch"
-                    ? "A LITTLE CHALLENGE FOR YOU"
-                    : "YOUR MOVE"}
-                </p>
-                <h1>{question.action}</h1>
-                <p className="question-subtitle">
-                  {result
-                    ? result.correct
-                      ? "Locked in. Keep the flow going."
-                      : "Take a look, then give another chord a go."
-                    : builderRequired
-                      ? "Build this chord safely on the keyboard below."
-                      : builderVisible
-                        ? "Select the keys on the keyboard below."
-                        : "Press the shortcut, or build it on screen."}
-                </p>
-              </div>
-              <div className="answer-zone" aria-live="polite">
-                <div className="captured-keys">
-                  {run.captured.length ? (
-                    run.captured.map((key) => (
-                      <span
-                        key={key}
-                        className={`answer-key ${result?.correct ? "key-correct" : "key-incorrect"}`}
-                      >
-                        {key}
-                      </span>
-                    ))
-                  ) : result ? (
-                    <span className="waiting-text">
-                      SKIPPED · ANSWER REVEALED BELOW
-                    </span>
-                  ) : (
-                    <span className="waiting-text">
-                      <span className="pulse-dot" />
-                      {builderVisible
-                        ? "YOUR CHORD GOES HERE"
-                        : "LISTENING FOR YOUR SHORTCUT"}
-                    </span>
-                  )}
-                </div>
-                {result && (
-                  <div
-                    className={`feedback ${result.correct ? "correct-feedback" : "incorrect-feedback"}`}
-                  >
-                    <span className="feedback-icon">
-                      {result.correct ? "✓" : "×"}
-                    </span>
-                    <span>
-                      <strong>
-                        {result.correct
-                          ? result.assisted
-                            ? "Good practice."
-                            : run.streak >= 3
-                              ? "You’re in the zone!"
-                              : "That’s the one."
-                          : "Next time, you’ll know."}
-                      </strong>
-                      {!result.correct && (
-                        <span className="correct-answer">
-                          {" "}
-                          {chordLabel(question.expected)}
-                        </span>
-                      )}
-                    </span>
-                    <span className="feedback-time">
-                      {result.correct ? `+${result.points} PTS · ` : ""}
-                      {result.seconds.toFixed(1)}s
-                    </span>
-                  </div>
-                )}
-              </div>
-              {run.hint && !result && (
-                <div className="hint-reveal">
-                  <span>TRY THIS CHORD</span>
-                  <strong>{chordLabel(question.expected)}</strong>
-                  <small>Learning rep · reduced XP · no combo</small>
-                </div>
-              )}
-              {!result && builderVisible && (
-                <KeyBuilder
-                  key={`${question.id}-${run.attempts.length}`}
-                  onSubmit={submit}
-                  protectedShortcut={builderRequired}
-                />
-              )}
-              {result && question.tip && (
-                <p className="question-tip">
-                  <span>REMEMBER</span>
-                  {question.tip}
-                </p>
-              )}
-              <div className="practice-card-footer">
-                {result ? (
-                  <>
-                    <button
-                      ref={actionRef}
-                      className="button button-primary next-button"
-                      onClick={next}
-                    >
-                      {nextFinishes ? "See results" : "Next chord"}{" "}
-                      <span>→</span>
-                    </button>
-                    <span className="enter-hint">
-                      {autoNext ? "Moving on automatically · " : ""}
-                      <kbd>Enter</kbd> continue
-                    </span>
-                  </>
-                ) : (
-                  <div className="play-tools">
-                    {!builderRequired && (
-                      <button
-                        className="builder-toggle"
-                        onClick={() => {
-                          setShowBuilder(!showBuilder);
-                          mainRef.current?.focus();
-                        }}
-                      >
-                        {showBuilder
-                          ? "Use physical keyboard"
-                          : "Use on-screen keyboard"}{" "}
-                        <span>⌨</span>
-                      </button>
-                    )}
-                    <button
-                      className="text-button"
-                      disabled={run.hint}
-                      onClick={() => dispatch({ type: "hint" })}
-                    >
-                      {run.hint ? "Hint revealed" : "Need a hint?"}
-                    </button>
-                    <button className="text-button" onClick={() => submit([])}>
-                      Skip
-                    </button>
-                  </div>
-                )}
-              </div>
-              <div className="card-bottomline">
-                <span>
-                  {builderRequired
-                    ? "◈ PROTECTED CHORD · SAFE BUILDER"
-                    : "ACTIVE RECALL → MUSCLE MEMORY"}
-                </span>
-                <button
-                  className="text-button"
-                  onClick={() => dispatch({ type: "pause", now: Date.now() })}
-                >
-                  Pause <kbd>Esc</kbd>
-                </button>
-              </div>
-            </div>
-          </section>
-        )}
       </div>
-      <footer className="practice-footer">
-        <span>KEYBOUND // ONE GOOD REP AT A TIME</span>
-        {run.phase !== "ready" && run.phase !== "finished" && (
-          <button
-            className="text-button"
-            onClick={() => dispatch({ type: "finish" })}
-          >
-            Finish round
-          </button>
-        )}
-        <span>
-          LEVEL {level.level} · {level.title.toUpperCase()}
-        </span>
-      </footer>
     </main>
   );
 }
-function KeyBuilder({
-  onSubmit,
-  protectedShortcut,
+
+function Summary({
+  run,
+  mode,
+  category,
+  tier,
+  accuracy,
+  flawless,
+  correctCount,
+  previousBest,
+  missed,
+  onRestart,
 }: {
-  onSubmit: (keys: string[]) => void;
-  protectedShortcut: boolean;
+  run: ReturnType<typeof freshRun>;
+  mode: GameMode;
+  category: ShortcutCategory | "all";
+  tier: Tier;
+  accuracy: number;
+  flawless: boolean;
+  correctCount: number;
+  previousBest: number;
+  missed: Shortcut[];
+  onRestart: () => void;
 }) {
-  const [keys, setKeys] = useState<string[]>([]);
-  const alphaRows = [
-    ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-    ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
-    ["Z", "X", "C", "V", "B", "N", "M"],
-  ];
-  const utilityKeys = ["`", "/", "Tab", "Delete", "Backspace", "F2", "F4"];
-  const arrows = ["Left", "Down", "Right", "Up"];
-  function toggle(key: string) {
-    setKeys((current) =>
-      current.includes(key)
-        ? current.filter((item) => item !== key)
-        : normalizeKeys([...current, key]),
-    );
-  }
-  function renderKey(key: string, className = "") {
-    const isActive = keys.includes(key);
-    return (
-      <button
-        type="button"
-        key={key}
-        autoFocus={key === "Ctrl"}
-        aria-pressed={isActive}
-        className={`builder-key ${className} ${isActive ? "active" : ""}`}
-        onClick={() => toggle(key)}
-      >
-        {prettyKey(key)}
-      </button>
-    );
-  }
+  const actionRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => actionRef.current?.focus({ preventScroll: true }), []);
+  const letter = run.attempts.length ? grade(accuracy, flawless) : "–";
+  const newBest = run.score > previousBest && run.score > 0;
+  const average =
+    run.attempts.reduce((sum, a) => sum + a.seconds, 0) /
+    Math.max(1, run.attempts.length);
+  const params = new URLSearchParams({ mode: "review" });
+  if (category !== "all") params.set("category", category);
+  if (tier !== "all") params.set("tier", tier);
   return (
-    <div
-      className="key-builder"
-      role="group"
-      aria-label="Keyboard shortcut builder"
-      onKeyDown={(event) => {
-        if (event.key === "Enter" && keys.length) {
-          event.preventDefault();
-          event.stopPropagation();
-          onSubmit(keys);
-        }
-      }}
-    >
-      <div className="builder-title">
-        <span>
-          {protectedShortcut ? "Safe practice builder" : "Build your chord"}
-        </span>
-        <span>{keys.length ? chordLabel(keys) : "Select keys below"}</span>
+    <section className="stage summary-stage">
+      <div className="summary-head">
+        <div className={`grade grade-${letter}`} aria-label={`Grade ${letter}`}>
+          <span>{letter}</span>
+          <svg viewBox="0 0 100 100" aria-hidden="true">
+            <circle cx="50" cy="50" r="45" className="grade-track" />
+            <circle
+              cx="50"
+              cy="50"
+              r="45"
+              className="grade-fill"
+              style={{ strokeDashoffset: 283 - 283 * accuracy }}
+            />
+          </svg>
+        </div>
+        <div>
+          {newBest && <span className="badge-best">★ New personal best</span>}
+          <h1 className="display">
+            {!run.attempts.length
+              ? "Round over."
+              : flawless
+                ? "Flawless."
+                : accuracy >= 0.75
+                  ? "Nicely played."
+                  : "You’re building it."}
+          </h1>
+          <p className="lede">
+            {run.attempts.length
+              ? `${correctCount} of ${run.attempts.length} landed in ${MODES[mode].name}. ${missed.length ? "The tricky ones are below." : "That’s real muscle memory."}`
+              : "Nothing answered this time. One more go?"}
+          </p>
+        </div>
       </div>
-      {protectedShortcut && (
-        <p className="builder-safety">
-          <span>i</span> This chord is kept inside the app so it cannot trigger
-          Windows or browser actions.
-        </p>
+      <div className="summary-stats">
+        <div>
+          <strong>{run.score.toLocaleString()}</strong>
+          <span>points</span>
+        </div>
+        <div>
+          <strong>{Math.round(accuracy * 100)}%</strong>
+          <span>accuracy</span>
+        </div>
+        <div>
+          <strong>{run.bestStreak}</strong>
+          <span>best combo</span>
+        </div>
+        <div>
+          <strong>{average.toFixed(1)}s</strong>
+          <span>avg time</span>
+        </div>
+        <div>
+          <strong>+{run.xp}</strong>
+          <span>XP earned</span>
+        </div>
+      </div>
+      {run.attempts.length > 0 && (
+        <div className="summary-list">
+          <span className="rail-label">Your round</span>
+          <ol>
+            {run.attempts.map((attempt, i) => (
+              <li
+                key={i}
+                className={
+                  attempt.correct
+                    ? attempt.assisted
+                      ? "assisted"
+                      : "good"
+                    : "bad"
+                }
+              >
+                <span className="recent-mark" aria-hidden="true">
+                  {attempt.correct ? (attempt.assisted ? "~" : "✓") : "×"}
+                </span>
+                <span className="recent-action">{attempt.shortcut.action}</span>
+                <span className="summary-points">
+                  {attempt.correct ? `+${attempt.points}` : "—"}
+                </span>
+                <Chord keys={attempt.shortcut.expected} size="sm" />
+              </li>
+            ))}
+          </ol>
+        </div>
       )}
-      <p className="builder-controls">
-        <kbd>Tab</kbd> move · <kbd>Space</kbd> toggle · <kbd>Enter</kbd> check
-      </p>
-      <div className="keyboard-board">
-        <div className="keyboard-row utility-row">
-          {utilityKeys.map((key) => renderKey(key, "utility-key"))}
-        </div>
-        {alphaRows.map((row, index) => (
-          <div
-            className={`keyboard-row alpha-row alpha-row-${index + 1}`}
-            key={row[0]}
+      <div className="summary-actions">
+        <button
+          ref={actionRef}
+          className="button button-primary button-lg"
+          onClick={onRestart}
+        >
+          Play again <span aria-hidden="true">↻</span>
+        </button>
+        {missed.length > 0 && mode !== "review" && (
+          <Link
+            className="button button-secondary"
+            href={`/practice?${params}`}
           >
-            {row.map((key) => renderKey(key))}
-          </div>
-        ))}
-        <div className="keyboard-row bottom-row">
-          {renderKey("Ctrl", "modifier-key modifier-ctrl")}
-          {renderKey("Win", "modifier-key modifier-win")}
-          {renderKey("Alt", "modifier-key modifier-alt")}
-          {renderKey("Space", "space-key")}
-          {renderKey("Shift", "modifier-key modifier-shift")}
-          <div className="arrow-cluster" aria-label="Arrow keys">
-            {arrows.map((key) =>
-              renderKey(key, `arrow-key arrow-${key.toLowerCase()}`),
-            )}
-          </div>
-        </div>
+            Drill weak spots
+          </Link>
+        )}
+        <Link className="button button-ghost" href="/">
+          Menu
+        </Link>
       </div>
-      <button
-        type="button"
-        className="builder-submit"
-        disabled={!keys.length}
-        onClick={() => onSubmit(keys)}
-      >
-        Check chord
-      </button>
-    </div>
+      <span className="key-hint">
+        <kbd>Enter</kbd> play again
+      </span>
+    </section>
   );
 }

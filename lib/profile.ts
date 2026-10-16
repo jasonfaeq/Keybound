@@ -46,6 +46,13 @@ export function readProfile(): Profile {
       best: scores(input.best),
       daily: scores(input.daily),
       sound: input.sound !== false,
+      lastDay:
+        typeof input.lastDay === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(input.lastDay)
+          ? input.lastDay
+          : "",
+      dayStreak: nonnegative(input.dayStreak),
+      bestDayStreak: nonnegative(input.bestDayStreak),
     };
   } catch {
     saved = false;
