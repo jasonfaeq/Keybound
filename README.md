@@ -1,51 +1,44 @@
-# Keybound // The Keyboard Arcade
+# Keybound
 
-A local-first Windows shortcut game built with Next.js 16 and React 19.
+A browser game for learning Windows keyboard shortcuts. Built with Next.js and React.
 
-## Run
+## Getting started
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-Open http://localhost:3000. No account or backend is needed.
+Open http://localhost:3000.
 
-## Play
+## Game modes
 
-Choose one of six modes and a shortcut category:
+- **Quick play**: ten prompts with no time limit.
+- **Blitz**: score as much as you can in 60 seconds.
+- **Survival**: keep playing until you lose all three lives.
+- **Daily mix**: ten shortcuts in a fixed order that changes each day.
+- **Weak spots**: practice the shortcuts you've missed.
+- **Free play**: an open-ended practice session.
 
-- **Quick play:** ten prompts, with time to think.
-- **Blitz:** a 60-second sprint. The timer starts when you start the round.
-- **Survival:** three lives; each wrong answer or skip costs one.
-- **Daily mix:** ten unique prompts in a reproducible order for your local calendar day. Daily mixes always cover all categories. Complete all ten to mark the day played.
-- **Weak spots:** prioritize previously missed shortcuts, then unfamiliar ones, before confident recalls.
-- **Free play:** keep going until you choose Finish round.
+Choose from 36 shortcuts across Windows, window management, browsers, File Explorer, text editing, and developer tools.
 
-Safe chords accept physical keyboard input. Shortcuts involving Windows, Alt, browser navigation, printing, or developer tools use the on-screen QWERTY builder. Click keys, or use Tab to navigate, Space to toggle, and Enter to check the assembled chord. Every shortcut can be built on screen, including backtick and slash.
+## Controls
 
-Use **Esc** to pause or resume. Switching away from the tab pauses the round automatically; response timing excludes breaks. Auto advance is optional and starts enabled for Blitz. Wrong answers stay visible longer before advancing.
+Press a shortcut to answer. For combinations that could close a tab, lock the computer, or trigger another system action, use the on-screen keyboard instead. You can use it for any prompt.
 
-## Scoring and progress
+In the on-screen keyboard, Tab moves between keys, Space toggles a key, and Enter submits. Esc pauses the round. Leaving the tab also pauses it.
 
-- Clean correct answers earn 100 base points plus a 50-point speed bonus under three seconds or 25 under six.
-- Every three consecutive clean answers increases the multiplier, up to 4x. A mistake or hinted answer resets the combo.
-- Hinted answers earn 40 points and reduced XP. Skips reveal the answer and count as misses.
-- XP unlocks levels and titles. Three consecutive unassisted recalls master a shortcut; hints and mistakes reset that shortcut's mastery streak.
-- Personal bests, mastery, XP, sound preferences, daily results, and four achievements persist in this browser's local storage. Storage failures fall back to progress for the current visit and display a notice.
-- Results show accuracy, score, best combo, XP, and a recap of missed or assisted shortcuts, with a direct route to review.
+Hints reveal the answer for fewer points. Wrong answers and skips break your combo. Three correct answers in a row increase the score multiplier, up to 4x. Faster answers earn a small bonus.
 
-The dataset includes 36 prompts across Windows & System, Window Management, Browser, File Explorer, Text Editing, and Developer Tools. VS Code prompts describe shortcuts to use in VS Code; the game checks recall without executing those actions.
+Progress, personal bests, and sound settings are saved in the current browser. Three consecutive answers without hints mark a shortcut as mastered.
 
-## Validate
+## Development
 
 ```sh
-npm test
-npm run typecheck
-npm run lint
-npm run build
+pnpm test
+pnpm typecheck
+pnpm lint
+pnpm build
 ```
 
-The test suite covers round limits, survival lives, duplicate submissions, hints, mastery, combo scoring, deterministic daily decks, targeted review, timer deadlines, pause accounting, saved records, and protected shortcuts. Tests transpile the TypeScript modules with the project's existing TypeScript dependency; no extra test runtime is required.
-
-Core rules are in `lib/game.ts`, browser persistence in `lib/profile.ts`, chord normalization and safety in `lib/shortcut.ts`, and the interactive round in `components/shortcut-trainer.tsx`.
+The game rules live in `lib/game.ts`, saved progress in `lib/profile.ts`, and keyboard handling in `lib/shortcut.ts`. The practice screen is in `components/shortcut-trainer.tsx`.

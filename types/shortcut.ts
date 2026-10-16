@@ -18,7 +18,10 @@ export type Shortcut = {
   tip?: string;
 };
 
-export const CATEGORY_META: Record<ShortcutCategory, { icon: string; detail: string; color: string }> = {
+export const CATEGORY_META: Record<
+  ShortcutCategory,
+  { icon: string; detail: string; color: string }
+> = {
   windows: { icon: "⊞", detail: "System essentials", color: "violet" },
   windowsManagement: { icon: "▣", detail: "Move with intent", color: "orange" },
   browser: { icon: "◌", detail: "Browse faster", color: "blue" },

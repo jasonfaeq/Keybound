@@ -37,7 +37,9 @@ export function prettyKey(key: string): string {
 
 export function normalizeKeys(keys: string[]): string[] {
   const cleaned = [...new Set(keys.map(prettyKey))];
-  const modifiers = modifierOrder.filter((modifier) => cleaned.includes(modifier));
+  const modifiers = modifierOrder.filter((modifier) =>
+    cleaned.includes(modifier),
+  );
   const rest = cleaned.filter((key) => !modifierOrder.includes(key)).sort();
   return [...modifiers, ...rest];
 }
@@ -50,7 +52,14 @@ export function keyEventToChord(event: KeyboardEvent): string[] {
   if (event.metaKey) modifiers.push("Win");
 
   const rawKey = event.key.length === 1 ? event.key : event.code || event.key;
-  const key = prettyKey(event.key === "Control" || event.key === "Alt" || event.key === "Shift" || event.key === "Meta" ? event.key : rawKey);
+  const key = prettyKey(
+    event.key === "Control" ||
+      event.key === "Alt" ||
+      event.key === "Shift" ||
+      event.key === "Meta"
+      ? event.key
+      : rawKey,
+  );
   const isModifier = ["Ctrl", "Alt", "Shift", "Win"].includes(key);
   return normalizeKeys(isModifier ? modifiers : [...modifiers, key]);
 }
@@ -65,7 +74,18 @@ export function chordLabel(keys: string[]): string {
   return normalizeKeys(keys).join(" + ");
 }
 
-const browserSensitiveKeys = new Set(["H", "J", "L", "N", "T", "U", "W", "P", "Tab", "I"]);
+const browserSensitiveKeys = new Set([
+  "H",
+  "J",
+  "L",
+  "N",
+  "T",
+  "U",
+  "W",
+  "P",
+  "Tab",
+  "I",
+]);
 
 /**
  * These combinations can affect the operating system or browser before a page
@@ -73,6 +93,14 @@ const browserSensitiveKeys = new Set(["H", "J", "L", "N", "T", "U", "W", "P", "T
  */
 export function requiresBuilder(keys: string[]): boolean {
   const normalized = normalizeKeys(keys);
-  if (normalized.includes("Win") || normalized.includes("Alt") || normalized.includes("F4")) return true;
-  return normalized.includes("Ctrl") && normalized.some((key) => browserSensitiveKeys.has(key));
+  if (
+    normalized.includes("Win") ||
+    normalized.includes("Alt") ||
+    normalized.includes("F4")
+  )
+    return true;
+  return (
+    normalized.includes("Ctrl") &&
+    normalized.some((key) => browserSensitiveKeys.has(key))
+  );
 }

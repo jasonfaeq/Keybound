@@ -5,15 +5,52 @@ import ts from "typescript";
 
 async function sourceModule(path) {
   const source = await readFile(new URL(path, import.meta.url), "utf8");
-  const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } });
-  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`);
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ES2022,
+      target: ts.ScriptTarget.ES2022,
+    },
+  });
+  return import(
+    `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
+  );
 }
-const { freshRun, runReducer, award, makeDeck, EMPTY_PROFILE, recordAttempt, recordSession, levelFor } = await sourceModule("../lib/game.ts");
-const { requiresBuilder, keyEventToChord, chordsMatch } = await sourceModule("../lib/shortcut.ts");
-const pool = Array.from({ length: 36 }, (_, i) => ({ id: `q${i}`, expected: ["Ctrl", "C"], action: `Action ${i}`, category: "textEditing", difficulty: "starter" }));
-const start = () => runReducer(freshRun(pool), { type: "start", deck: pool, now: 1000 });
-const answer = (run, correct = true, mode = "practice") => runReducer(run, { type: "answer", correct, mode, keys: ["Ctrl", "C"], now: run.startedAt + 2000 });
-const next = (run, mode = "practice") => runReducer(run, { type: "next", mode, deck: pool, now: run.startedAt + 2500 });
+const {
+  freshRun,
+  runReducer,
+  award,
+  makeDeck,
+  EMPTY_PROFILE,
+  recordAttempt,
+  recordSession,
+  levelFor,
+} = await sourceModule("../lib/game.ts");
+const { requiresBuilder, keyEventToChord, chordsMatch } =
+  await sourceModule("../lib/shortcut.ts");
+const pool = Array.from({ length: 36 }, (_, i) => ({
+  id: `q${i}`,
+  expected: ["Ctrl", "C"],
+  action: `Action ${i}`,
+  category: "textEditing",
+  difficulty: "starter",
+}));
+const start = () =>
+  runReducer(freshRun(pool), { type: "start", deck: pool, now: 1000 });
+const answer = (run, correct = true, mode = "practice") =>
+  runReducer(run, {
+    type: "answer",
+    correct,
+    mode,
+    keys: ["Ctrl", "C"],
+    now: run.startedAt + 2000,
+  });
+const next = (run, mode = "practice") =>
+  runReducer(run, {
+    type: "next",
+    mode,
+    deck: pool,
+    now: run.startedAt + 2500,
+  });
 
 test("a ten-prompt round finishes once and ignores double submissions", () => {
   let run = start();
@@ -28,7 +65,8 @@ test("a ten-prompt round finishes once and ignores double submissions", () => {
 });
 test("survival ends after exactly three mistakes", () => {
   let run = start();
-  for (let i = 0; i < 3; i++) run = next(answer(run, false, "survival"), "survival");
+  for (let i = 0; i < 3; i++)
+    run = next(answer(run, false, "survival"), "survival");
   assert.equal(run.phase, "finished");
   assert.equal(run.lives, 0);
 });
@@ -53,18 +91,36 @@ test("daily decks are unique, reproducible, and independent of mastery", () => {
   const first = makeDeck(pool, "daily", EMPTY_PROFILE, "2026-10-16");
   assert.equal(first.length, 10);
   assert.equal(new Set(first.map((s) => s.id)).size, 10);
-  assert.deepEqual(first, makeDeck(pool, "daily", { ...EMPTY_PROFILE, xp: 999 }, "2026-10-16"));
-  assert.notDeepEqual(first, makeDeck(pool, "daily", EMPTY_PROFILE, "2026-10-17"));
+  assert.deepEqual(
+    first,
+    makeDeck(pool, "daily", { ...EMPTY_PROFILE, xp: 999 }, "2026-10-16"),
+  );
+  assert.notDeepEqual(
+    first,
+    makeDeck(pool, "daily", EMPTY_PROFILE, "2026-10-17"),
+  );
   assert.equal(pool[0].id, "q0");
 });
 test("review serves previously missed shortcuts before mastered ones", () => {
-  const profile = { ...EMPTY_PROFILE, mastery: { q0: { attempts: 4, correct: 0, chain: 0 }, q1: { attempts: 4, correct: 4, chain: 4 } } };
+  const profile = {
+    ...EMPTY_PROFILE,
+    mastery: {
+      q0: { attempts: 4, correct: 0, chain: 0 },
+      q1: { attempts: 4, correct: 4, chain: 4 },
+    },
+  };
   const deck = makeDeck(pool, "review", profile, "2026-10-16");
   assert.equal(deck[0].id, "q0");
   assert.equal(deck.at(-1).id, "q1");
 });
 test("the real deadline rejects late answers even before the timer ticks", () => {
-  const run = runReducer(start(), { type: "answer", correct: true, keys: ["Ctrl", "C"], mode: "timed", now: 61000 });
+  const run = runReducer(start(), {
+    type: "answer",
+    correct: true,
+    keys: ["Ctrl", "C"],
+    mode: "timed",
+    now: 61000,
+  });
   assert.equal(run.phase, "finished");
   assert.equal(run.attempts.length, 0);
 });
@@ -73,12 +129,23 @@ test("pausing preserves time and excludes the break from response speed", () => 
   assert.equal(answer(run), run);
   assert.equal(run.remaining, 58000);
   run = runReducer(run, { type: "resume", now: 103000 });
-  run = runReducer(run, { type: "answer", correct: true, keys: ["Ctrl", "C"], mode: "timed", now: 104000 });
+  run = runReducer(run, {
+    type: "answer",
+    correct: true,
+    keys: ["Ctrl", "C"],
+    mode: "timed",
+    now: 104000,
+  });
   assert.equal(run.attempts[0].seconds, 3);
   assert.equal(run.deadline, 161000);
 });
 test("personal and daily records never decrease; levels progress", () => {
-  assert.equal(recordSession(EMPTY_PROFILE, "daily", 200, "2026-10-16", false).daily["2026-10-16"], undefined);
+  assert.equal(
+    recordSession(EMPTY_PROFILE, "daily", 200, "2026-10-16", false).daily[
+      "2026-10-16"
+    ],
+    undefined,
+  );
   let profile = recordSession(EMPTY_PROFILE, "daily", 1500, "2026-10-16");
   profile = recordSession(profile, "daily", 500, "2026-10-16");
   assert.equal(profile.best.daily, 1500);
@@ -89,8 +156,22 @@ test("personal and daily records never decrease; levels progress", () => {
   assert.equal(levelFor(480).level, 3);
 });
 test("OS and browser navigation chords stay in the builder", () => {
-  for (const keys of [["Win", "L"], ["Alt", "F4"], ["Ctrl", "Tab"], ["Ctrl", "P"], ["Ctrl", "Shift", "I"], ["Ctrl", "W"]]) assert.equal(requiresBuilder(keys), true);
+  for (const keys of [
+    ["Win", "L"],
+    ["Alt", "F4"],
+    ["Ctrl", "Tab"],
+    ["Ctrl", "P"],
+    ["Ctrl", "Shift", "I"],
+    ["Ctrl", "W"],
+  ])
+    assert.equal(requiresBuilder(keys), true);
   assert.equal(requiresBuilder(["Ctrl", "C"]), false);
-  assert.equal(chordsMatch(["Shift", "Ctrl", "t"], ["Ctrl", "Shift", "T"]), true);
-  assert.deepEqual(keyEventToChord({ key: "ArrowRight", code: "ArrowRight", ctrlKey: true }), ["Ctrl", "Right"]);
+  assert.equal(
+    chordsMatch(["Shift", "Ctrl", "t"], ["Ctrl", "Shift", "T"]),
+    true,
+  );
+  assert.deepEqual(
+    keyEventToChord({ key: "ArrowRight", code: "ArrowRight", ctrlKey: true }),
+    ["Ctrl", "Right"],
+  );
 });
